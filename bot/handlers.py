@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 from . import token_manager
-from .api_client import fetch_demo_detail, search_organizations
+from .api_client import fetch_demo_detail, fetch_upcoming_demos, search_organizations
 from .database import (
     add_subscription,
     add_admin,
