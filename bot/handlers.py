@@ -14,6 +14,7 @@ from telegram.ext import (
 
 from . import token_manager
 from .api_client import fetch_demo_detail, fetch_upcoming_demos, search_organizations
+from .notifications import format_demo_compact
 from .database import (
     add_subscription,
     add_admin,
@@ -88,6 +89,7 @@ async def build_catalog(max_days_till: int = 60) -> None:
 
 async def _main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Tulevat mielenosoitukset", callback_data="list:0")],
         [InlineKeyboardButton("🏙️ Kaupungit", callback_data="cities")],
         [InlineKeyboardButton("🏢 Järjestöt", callback_data="orgs")],
         [InlineKeyboardButton("🔁 Mielenosoitusketjut", callback_data="chains")],
@@ -345,6 +347,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                       reply_markup=await _chain_keyboard(chat_id))
         return
 
+    if data.startswith("list:"):
+        page = int(data.split(":")[1])
+        await query.answer()
+        await _send_list_page(
+            lambda text, **kw: query.edit_message_text(text, **kw),
+            page,
+        )
+        return
+
 
 # ── Text search handler ────────────────────────────────────────────
 
@@ -384,11 +395,65 @@ async def peru(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Peruutettu.", reply_markup=await _main_menu())
 
 
+# ── Listing upcoming demos ─────────────────────────────────────────
+
+DEMO_LIST_PAGE_SIZE = 20
+
+
+async def listaa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show upcoming demos, paginated."""
+    await _send_list_page(update.message.reply_text, 0, context.user_data)
+
+
+async def _send_list_page(send_fn, page: int, user_data: dict | None = None) -> None:
+    if not token_manager.is_configured():
+        await send_fn("❌ API-tokenia ei ole asetettu. Käytä /config.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    try:
+        data = await fetch_upcoming_demos(max_days_till=90, per_page=100)
+    except Exception:
+        logger.exception("Failed to fetch demos for listing")
+        await send_fn("❌ Mielenosoituksia ei voitu hakea.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    total = len(data)
+    if total == 0:
+        await send_fn("Ei tulevia mielenosoituksia.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    start = page * DEMO_LIST_PAGE_SIZE
+    end = start + DEMO_LIST_PAGE_SIZE
+    chunk = data[start:end]
+    total_pages = (total + DEMO_LIST_PAGE_SIZE - 1) // DEMO_LIST_PAGE_SIZE
+
+    lines = [f"*Tulevat mielenosoitukset* ({start+1}–{min(end, total)}/{total})\n"]
+    for d in chunk:
+        lines.append(format_demo_compact(d))
+
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Edelliset", callback_data=f"list:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("Seuraavat ▶️", callback_data=f"list:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔄 Päivitä", callback_data=f"list:{page}")])
+
+    await send_fn(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
+
+
 # ── Handler registration ───────────────────────────────────────────
 
 def build_handlers(app) -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("listaa", listaa))
     app.add_handler(CommandHandler("ohjeet", ohjeet))
     app.add_handler(CommandHandler("config", config))
     app.add_handler(CommandHandler("paivita", paivita))

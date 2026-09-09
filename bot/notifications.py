@@ -52,3 +52,27 @@ def format_demo(demo: dict) -> str:
 
 def _escape(text: str) -> str:
     return (text or "").replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+
+
+_MONTHS_SHORT_FI = ["", "tammi", "helmi", "maalisk", "huhti", "touko", "kesä",
+                     "heinä", "elo", "syys", "loka", "marras", "joulu"]
+
+
+def format_demo_compact(demo: dict) -> str:
+    """One-line compact format for listing."""
+    title = demo.get("title") or "Tapahtuma"
+    date = demo.get("date") or ""
+    start_time = (demo.get("start_time") or "")[:5]
+    city = demo.get("city") or ""
+    cancelled = "❌ " if demo.get("cancelled") else ""
+
+    date_str = ""
+    if date:
+        try:
+            y, m, d = (int(x) for x in date.split("-"))
+            date_str = f"{d}.{m}."
+        except (ValueError, KeyError):
+            date_str = date
+
+    time_part = f" {start_time}" if start_time else ""
+    return f"{cancelled}*{_escape(title)}* — {date_str}{time_part} · {_escape(city)}"
