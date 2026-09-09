@@ -34,6 +34,12 @@ async def init_db(db_path: str) -> None:
                 chat_id INTEGER PRIMARY KEY,
                 added_at TEXT DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS group_links (
+                user_chat_id  INTEGER NOT NULL,
+                group_chat_id INTEGER NOT NULL,
+                created_at    TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (user_chat_id, group_chat_id)
+            );
             """
         )
         await db.commit()
@@ -149,3 +155,36 @@ async def is_bootstrapped() -> bool:
     async with _db() as db:
         rows = await db.execute_fetchall("SELECT 1 FROM admins LIMIT 1")
         return len(rows) > 0
+
+
+# ── group links (DM ↔ group pairing) ──────────────────────────────
+
+async def link_group(user_chat_id: int, group_chat_id: int, group_title: str) -> None:
+    async with _db() as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO group_links (user_chat_id, group_chat_id) VALUES (?, ?)",
+            (user_chat_id, group_chat_id),
+        )
+        await db.execute(
+            "UPDATE subscriptions SET chat_title = ? WHERE chat_id = ?",
+            (group_title, group_chat_id),
+        )
+        await db.commit()
+
+
+async def get_linked_groups(user_chat_id: int) -> list[int]:
+    async with _db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT group_chat_id FROM group_links WHERE user_chat_id = ?",
+            (user_chat_id,),
+        )
+        return [r[0] for r in rows]
+
+
+async def get_linked_users(group_chat_id: int) -> list[int]:
+    async with _db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT user_chat_id FROM group_links WHERE group_chat_id = ?",
+            (group_chat_id,),
+        )
+        return [r[0] for r in rows]
