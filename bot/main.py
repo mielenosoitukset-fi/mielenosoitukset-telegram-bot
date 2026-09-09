@@ -46,6 +46,18 @@ async def run() -> None:
     application.job_queue.run_repeating(lambda ctx: periodic_refresh_catalog(), interval=settings.poll_minutes * 60, first=0)
 
     async with application:
+        # Register slash commands with Telegram
+        await application.bot.set_my_commands([
+            ("start", "Käynnistä botti"),
+            ("listaa", "Listaa tulevat mielenosoitukset"),
+            ("menu", "Avaa päävalikko"),
+            ("config", "Aseta API-token (ylläpitäjä)"),
+            ("paivita", "Päivitä katalogi (ylläpitäjä)"),
+            ("status", "Tarkista botin tila"),
+            ("ohjeet", "Näytä ohjeet"),
+        ])
+        logger.info("Slash commands registered with Telegram")
+
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
         for sig in (signal.SIGINT, signal.SIGTERM):
