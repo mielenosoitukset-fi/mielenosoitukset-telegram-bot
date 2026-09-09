@@ -30,6 +30,10 @@ async def init_db(db_path: str) -> None:
                 sent_at    TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (chat_id, demo_id)
             );
+            CREATE TABLE IF NOT EXISTS admins (
+                chat_id INTEGER PRIMARY KEY,
+                added_at TEXT DEFAULT (datetime('now'))
+            );
             """
         )
         await db.commit()
@@ -125,3 +129,23 @@ async def cleanup_old_seen(days: int = 90) -> None:
             (f"-{days} days",),
         )
         await db.commit()
+
+
+# ── admins ─────────────────────────────────────────────────────────
+
+async def add_admin(chat_id: int) -> None:
+    async with _db() as db:
+        await db.execute("INSERT OR IGNORE INTO admins (chat_id) VALUES (?)", (chat_id,))
+        await db.commit()
+
+
+async def get_admins() -> list[int]:
+    async with _db() as db:
+        rows = await db.execute_fetchall("SELECT chat_id FROM admins")
+        return [r[0] for r in rows]
+
+
+async def is_bootstrapped() -> bool:
+    async with _db() as db:
+        rows = await db.execute_fetchall("SELECT 1 FROM admins LIMIT 1")
+        return len(rows) > 0

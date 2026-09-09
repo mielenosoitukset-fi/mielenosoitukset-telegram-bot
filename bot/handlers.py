@@ -16,6 +16,9 @@ from . import token_manager
 from .api_client import fetch_demo_detail, search_organizations
 from .database import (
     add_subscription,
+    add_admin,
+    get_admins,
+    is_bootstrapped,
     get_subscriptions,
     remove_subscription,
 )
@@ -30,14 +33,10 @@ CHAINS: list[dict] = []     # {id, title}
 # Pending org-search state per chat: user selected "search org" then types a name
 _org_search_pending: set[int] = set()
 
-ADMIN_IDS = {int(x) for x in (0,)}
 
-# Store admin chat IDs (whoever configures via /config becomes an admin for the bot)
-_ADMIN_CHATS: set[int] = set()
-
-
-def _is_admin(chat_id: int) -> bool:
-    return chat_id in _ADMIN_CHATS or chat_id in ADMIN_IDS
+async def _is_admin(chat_id: int) -> bool:
+    admins = await get_admins()
+    return chat_id in admins
 
 
 def get_chat_title(update: Update) -> str:
@@ -168,6 +167,20 @@ async def _chain_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+
+    # Auto-bootstrap: first person to message the bot becomes admin
+    if not await is_bootstrapped():
+        await add_admin(chat_id)
+        text = (
+            "*Tervetuloa!*\n\n"
+            "Olet bottin ensimmäinen käyttäjä ja sait automaattisesti "
+            "ylläpitäjän oikeudet.\n\n"
+            "Käytä /config asettaaksesi mielenosoitukset.fi API-tokenin.\n"
+            "Sitten voit tilata mielenosoituksia alta."
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=await _main_menu())
+        return
+
     text = await _overview(chat_id, get_chat_title(update))
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=await _main_menu())
 
@@ -193,7 +206,7 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Set up the API token. Accepts a token as an argument or via follow-up.",
     """
     chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
+    if not await _is_admin(chat_id):
         await update.message.reply_text("❌ Sinulla ei ole oikeutta määrittää tokenia.")
         return
     args = context.args
@@ -226,7 +239,7 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def paivita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_chat.id):
+    if not await _is_admin(update.effective_chat.id):
         await update.message.reply_text("❌ Sinulla ei ole oikeutta.")
         return
     msg = await update.message.reply_text("Päivitetään katalogia…")
@@ -386,6 +399,9 @@ def build_handlers(app) -> None:
 
 
 async def set_admin_from_env(chat_ids: str) -> None:
-    global _ADMIN_CHATS
+    """Seed admins from ADMIN_CHAT_IDS env var (comma-separated)."""
     if chat_ids:
-        _ADMIN_CHATS |= {int(x.strip()) for x in chat_ids.split(",") if x.strip()}
+        for cid in chat_ids.split(","):
+            cid = cid.strip()
+            if cid:
+                await add_admin(int(cid))
