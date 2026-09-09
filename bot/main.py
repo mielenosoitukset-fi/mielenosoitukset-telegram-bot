@@ -49,6 +49,7 @@ async def run() -> None:
         # Register slash commands with Telegram
         await application.bot.set_my_commands([
             ("start", "Käynnistä botti"),
+            ("tilaa", "Hallitse tilauksia"),
             ("listaa", "Listaa tulevat mielenosoitukset"),
             ("menu", "Avaa päävalikko"),
             ("config", "Aseta API-token (ylläpitäjä)"),

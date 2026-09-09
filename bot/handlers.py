@@ -35,9 +35,40 @@ CHAINS: list[dict] = []     # {id, title}
 _org_search_pending: set[int] = set()
 
 
+def _is_group(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type in ("group", "supergroup")
+
+
+def _is_channel(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == "channel"
+
+
+def _is_private(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == "private"
+
+
 async def _is_admin(chat_id: int) -> bool:
     admins = await get_admins()
     return chat_id in admins
+
+
+async def _is_chat_admin(update: Update) -> bool:
+    """Check if the sender is an admin/creator of the Telegram chat."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return False
+    # Private chats — the user is always "admin" of their own chat
+    if chat.type == "private":
+        return True
+    try:
+        member = await chat.get_member(user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
 
 
 def get_chat_title(update: Update) -> str:
@@ -61,8 +92,7 @@ async def build_catalog(max_days_till: int = 60) -> None:
         chain_set: dict[str, str] = {}
         org_map: dict[str, str] = {}
 
-        # Collect chains + orgs from demo detail (includes parent + organizers).
-        for d in demos[:30]:  # bound the number of detail requests
+        for d in demos[:30]:
             demo_id = d.get("_id") or d.get("id")
             if not demo_id:
                 continue
@@ -101,13 +131,13 @@ async def _overview(chat_id: int, chat_title: str) -> str:
     subs = await get_subscriptions(chat_id)
     if not subs:
         return (
-            f"*Tervetuloa, {chat_title}!*\n\n"
-            "Tämä botti ilmoittaa sinulle uusista mielenosoituksista "
-            "mielenosoitukset.fi:stä.\n\n"
+            f"*{chat_title}*\n\n"
+            "Tilaa mielenosoituksia kaupungin, järjestön tai ketjun mukaan.\n\n"
             "Valitse alta mitä haluat seurata:\n"
-            "🏙️ *Kaupungit* – kaikki mielenosoitukset valitsemassasi kaupungissa\n"
+            "🏙️ *Kaupungit* – kaikki mielenosoitukset kaupungissa\n"
             "🏢 *Järjestöt* – tietyn järjestön järjestämät\n"
             "🔁 *Ketjut* – toistuvat mielenosoitusketjut\n\n"
+            "Tilaukset ilmoittavat täällä kun uusia mielenosoituksia lisätään."
         )
 
     lines = [f"*{chat_title} – tilauksesi:*\n"]
@@ -115,14 +145,11 @@ async def _overview(chat_id: int, chat_title: str) -> str:
     org = [s["sub_label"] for s in subs if s["sub_type"] == "org"]
     chain = [s["sub_label"] for s in subs if s["sub_type"] == "chain"]
     if city:
-        lines.append("🏙️ *Kaupungit:*")
-        lines.append("\n".join(f"  • {c}" for c in city))
+        lines.append("🏙️ *Kaupungit:* " + ", ".join(city))
     if org:
-        lines.append("\n🏢 *Järjestöt:*")
-        lines.append("\n".join(f"  • {o}" for o in org))
+        lines.append("🏢 *Järjestöt:* " + ", ".join(org))
     if chain:
-        lines.append("\n🔁 *Ketjut:*")
-        lines.append("\n".join(f"  • {c}" for c in chain))
+        lines.append("🔁 *Ketjut:* " + ", ".join(chain))
     return "\n".join(lines)
 
 
@@ -169,8 +196,25 @@ async def _chain_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    is_grp = _is_group(update)
+    is_ch = _is_channel(update)
 
-    # Auto-bootstrap: first person to message the bot becomes admin
+    # Channel: minimal ack, no menus
+    if is_ch:
+        await update.message.reply_text("✅ Mielenosoitukset.fi -botti kanavalla.")
+        return
+
+    # Group: brief, no spam
+    if is_grp:
+        text = (
+            f"*{get_chat_title(update)}*\n\n"
+            "Tilaa mielenosoituksia kaupungin, järjestön tai ketjun mukaan.\n"
+            "Käytä /menu hallitaksesi tilauksia."
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Private: full onboarding
     if not await is_bootstrapped():
         await add_admin(chat_id)
         text = (
@@ -194,25 +238,39 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def ohjeet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    text = (
         "*Ohjeet*\n\n"
-        "Tilaa mielenosoituksia kaupungin, järjestön tai mielenosoitusketjun mukaan.\n"
-        "Saat ilmoituksen tähän keskusteluun aina kun uusi mielenosoitus lisätään.\n\n"
-        "Käytä /menu nähdäksesi tilauksesi ja hallitaksesi niitä.\n"
-        "Paina ➕ tilataksesi, ✅ poistaaksesi.",
-        parse_mode=ParseMode.MARKDOWN,
+        "🏙️ *Kaupungit* – ilmoitus kaikista mielenosoituksista kaupungissa\n"
+        "🏢 *Järjestöt* – ilmoitus tietyn järjestön järjestämistä\n"
+        "🔁 *Ketjut* – ilmoitus toistuvista mielenosoitusketjuista\n"
+        "📋 *Listaa* – selaa tulevia mielenosoituksia\n\n"
+        "Paina ➕ tilataksesi, ✅ poistaaksesi tilauksen."
     )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def tilaa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias for /menu — easier to remember in groups."""
+    await menu(update, context)
 
 
 async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set up the API token. Accepts a token as an argument or via follow-up.",
-    """
+    """Set up the API token. Admin-only (DB admin or group admin)."""
     chat_id = update.effective_chat.id
-    if not await _is_admin(chat_id):
-        await update.message.reply_text("❌ Sinulla ei ole oikeutta määrittää tokenia.")
-        return
-    args = context.args
+    is_grp = _is_group(update)
 
+    # In groups: must be a Telegram group admin
+    # In private: must be a DB admin
+    if is_grp:
+        if not await _is_chat_admin(update):
+            await update.message.reply_text("❌ Vain ryhmän ylläpitäjä voi asettaa tokenia.")
+            return
+    else:
+        if not await _is_admin(chat_id):
+            await update.message.reply_text("❌ Sinulla ei ole oikeutta määrittää tokenia.")
+            return
+
+    args = context.args
     if not args:
         await update.message.reply_text(
             "Käytä näin:\n\n`/config <lyhytaikainen-token>`\n\n"
@@ -235,15 +293,24 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     })
     await update.message.reply_text(
         "✅ Token asetettu! Botti käyttää nyt pitkäaikaista API-tokenia.\n"
-        "Lataa katalogi komennolla /paivita.",
+        "Käytä /paivita päivittääksesi katalogi.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def paivita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _is_admin(update.effective_chat.id):
-        await update.message.reply_text("❌ Sinulla ei ole oikeutta.")
-        return
+    chat_id = update.effective_chat.id
+    is_grp = _is_group(update)
+
+    if is_grp:
+        if not await _is_chat_admin(update):
+            await update.message.reply_text("❌ Vain ryhmän ylläpitäjä voi päivittää katalogia.")
+            return
+    else:
+        if not await _is_admin(chat_id):
+            await update.message.reply_text("❌ Sinulla ei ole oikeutta.")
+            return
+
     msg = await update.message.reply_text("Päivitetään katalogia…")
     await build_catalog()
     await msg.edit_text(
@@ -256,8 +323,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     subs = await get_subscriptions(chat_id)
     token_state = "✅" if token_manager.is_configured() else "❌"
+    chat_type = update.effective_chat.type
     lines = [
         f"*Botti status*",
+        f"Tila: {chat_type}",
         f"API token: {token_state}",
         f"Tilaukset: {len(subs)}",
     ]
@@ -300,10 +369,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "help":
         await query.edit_message_text(
             "*Ohjeet*\n\n"
-            "🏙️ *Kaupungit* – ilmoitus kaikista mielenosoituksista valitsemassasi kaupungissa.\n"
+            "🏙️ *Kaupungit* – ilmoitus kaikista mielenosoituksista kaupungissa.\n"
             "🏢 *Järjestöt* – ilmoitus tietyn järjestön järjestämistä.\n"
-            "🔁 *Ketjut* – ilmoitus toistuvista mielenosoitusketjuista.\n\n"
-            "Paina ➕ tilataksesi, ✅ poistaaksesi tilauksen.\n"
+            "🔁 *Ketjut* – ilmoitus toistuvista mielenosoitusketjuista.\n"
+            "📋 *Listaa* – selaa tulevia mielenosoituksia.\n\n"
+            "Paina ➕ tilataksesi, ✅ poistaaksesi.\n"
             "Etkö löydä järjestöä? Paina *Etsi järjestöä* ja kirjoita nimi.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")]]),
@@ -425,7 +495,6 @@ async def _send_list_page(send_fn, page: int, user_data: dict | None = None) -> 
     start = page * DEMO_LIST_PAGE_SIZE
     end = start + DEMO_LIST_PAGE_SIZE
     chunk = data[start:end]
-    total_pages = (total + DEMO_LIST_PAGE_SIZE - 1) // DEMO_LIST_PAGE_SIZE
 
     lines = [f"*Tulevat mielenosoitukset* ({start+1}–{min(end, total)}/{total})\n"]
     for d in chunk:
@@ -453,6 +522,7 @@ async def _send_list_page(send_fn, page: int, user_data: dict | None = None) -> 
 def build_handlers(app) -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("tilaa", tilaa))
     app.add_handler(CommandHandler("listaa", listaa))
     app.add_handler(CommandHandler("ohjeet", ohjeet))
     app.add_handler(CommandHandler("config", config))
