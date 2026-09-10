@@ -32,6 +32,8 @@ async def handle_error(update, context) -> None:
         message = str(context.error.message or "")
         if "message is not modified" in message:
             return
+        if "query is too old" in message.lower() or "button_data_invalid" in message:
+            return
     logger.error("Unhandled handler error", exc_info=context.error)
 
 
