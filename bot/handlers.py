@@ -12,7 +12,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    TypeHandler,
     filters,
 )
 
@@ -44,6 +43,10 @@ _org_search_pending: set[int] = set()
 _pending_pairing: dict[str, dict] = {}
 
 PAIRING_CODE_TTL = 600  # 10 minutes
+
+# Default CommandHandler filter only matches UpdateType.MESSAGES, which excludes
+# channel_posts. Commands must work in channels too, so match both.
+_COMMAND_FILTER = filters.UpdateType.CHANNEL_POST | filters.UpdateType.MESSAGES
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -282,7 +285,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_entity = is_grp or is_ch
 
     if is_ch:
-        await update.message.reply_text("✅ Mielenosoitukset.fi -botti kanavalla.")
+        await update.effective_message.reply_text("✅ Mielenosoitukset.fi -botti kanavalla.")
         return
 
     if is_grp:
@@ -296,7 +299,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  /listaa – kaikki tulevat\n\n"
             "Ylläpitäjä voi hallita asetuksia DM:stä komennolla /ryhma."
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
         return
 
     if not await is_bootstrapped():
@@ -308,12 +311,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Käytä /config asettaaksesi API-tokenin.\n"
             "Sitten voit tilata mielenosoituksia alta."
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML,
                                         reply_markup=await _main_menu())
         return
 
     text = await _overview(chat_id, get_chat_title(update))
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML,
                                     reply_markup=await _main_menu())
 
 
@@ -321,7 +324,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     is_entity = _is_group(update) or _is_channel(update)
     text = await _overview(chat_id, get_chat_title(update), is_entity=is_entity)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML,
                                     reply_markup=await _main_menu(is_group_or_channel=is_entity))
 
 
@@ -343,21 +346,21 @@ async def ohjeet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Ryhmiin ja kanaviin:</b>\n"
         "Ylläpitäjä voi liittää DM:nsä komennolla /ryhma."
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ── Quick-filter commands ──────────────────────────────────────────
 
 async def tanaan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not token_manager.is_configured():
-        await update.message.reply_text("❌ API-tokenia ei ole asetettu.")
+        await update.effective_message.reply_text("❌ API-tokenia ei ole asetettu.")
         return
-    msg = await update.message.reply_text("Haetaan…")
+    msg = await update.effective_message.reply_text("Haetaan…")
     try:
         demos = await fetch_all_upcoming_demos(max_days_till=1, per_page=100)
         today = _filter_demos(demos, today=True)
         await msg.delete()
-        await _send_filtered_listing(update.message.reply_text, today, "Tänään")
+        await _send_filtered_listing(update.effective_message.reply_text, today, "Tänään")
     except Exception:
         logger.exception("Failed")
         await msg.edit_text("❌ Haku epäonnistui.")
@@ -365,14 +368,14 @@ async def tanaan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def viikolla(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not token_manager.is_configured():
-        await update.message.reply_text("❌ API-tokenia ei ole asetettu.")
+        await update.effective_message.reply_text("❌ API-tokenia ei ole asetettu.")
         return
-    msg = await update.message.reply_text("Haetaan…")
+    msg = await update.effective_message.reply_text("Haetaan…")
     try:
         demos = await fetch_all_upcoming_demos(max_days_till=14, per_page=100)
         this_week = _filter_demos(demos, this_week=True)
         await msg.delete()
-        await _send_filtered_listing(update.message.reply_text, this_week, "Tällä viikolla")
+        await _send_filtered_listing(update.effective_message.reply_text, this_week, "Tällä viikolla")
     except Exception:
         logger.exception("Failed")
         await msg.edit_text("❌ Haku epäonnistui.")
@@ -383,14 +386,16 @@ async def viikolla(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def ryhma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Generate a pairing code. Works in groups AND channels."""
     if not (_is_group(update) or _is_channel(update)):
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Käytä tätä komentoa ryhmässä tai kanavassa, jonka haluat liittää DM:ään.\n"
             "Siirry ryhmään/kanavaan ja lähetä /ryhma siellä."
         )
         return
 
-    if not await _is_chat_admin(update):
-        await update.message.reply_text("❌ Vain ylläpitäjä voi liittää ryhmän/kanavan.")
+    # Channel posts can only be authored by channel admins, so we trust them.
+    # In groups the effective_user is present and we verify admin status.
+    if update.message is not None and not await _is_chat_admin(update):
+        await update.effective_message.reply_text("❌ Vain ylläpitäjä voi liittää ryhmän/kanavan.")
         return
 
     _cleanup_pending_pairing()
@@ -402,7 +407,7 @@ async def ryhma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "entity_type": entity_type,
         "created_at": time.time(),
     }
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"<b>Liittämislinkki luotu!</b>\n\n"
         f"Koodi: <code>{code}</code>\n\n"
         f"Siirry botin DM-chattiin ja lähetä:\n"
@@ -415,12 +420,12 @@ async def ryhma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def liita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Link a group/channel to this DM chat. Must be sent in DM."""
     if not _is_private(update):
-        await update.message.reply_text("Käytä tätä komentoa botin DM-chattissa.")
+        await update.effective_message.reply_text("Käytä tätä komentoa botin DM-chattissa.")
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Käytä näin: <code>/liita &lt;koodi&gt;</code>\n\n"
             "Hanki koodi ryhmässä/kanavassa komennolla /ryhma.",
             parse_mode=ParseMode.HTML,
@@ -431,7 +436,7 @@ async def liita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _cleanup_pending_pairing()
 
     if code not in _pending_pairing:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "❌ Kelvoton tai vanhentunut koodi.\n"
             "Pyydä ylläpitäjää luomaan uusi koodi komennolla /ryhma ryhmässä/kanavassa."
         )
@@ -441,7 +446,7 @@ async def liita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_chat.id
     await link_entity(user_id, info["entity_chat_id"], info["entity_type"], info["entity_title"])
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"<b>Liitetty!</b>\n\n"
         f"Tyyppi: {info['entity_type']}\n"
         f"Nimi: {info['entity_title']}\n\n"
@@ -458,7 +463,7 @@ async def hallinta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     entities = await get_linked_entities(update.effective_chat.id)
     if not entities:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Et ole liittänyt yhtään ryhmää tai kanavaa.\n"
             "Liitä ryhmä/kanava komennolla /ryhma siellä, sitten /liita <koodi> tässä."
         )
@@ -477,7 +482,7 @@ async def hallinta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         ])
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "<b>Liitetyt ryhmät ja kanavat:</b>\nValitse hallittava:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -492,16 +497,16 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_grp:
         if not await _is_chat_admin(update):
-            await update.message.reply_text("❌ Vain ryhmän ylläpitäjä voi asettaa tokenia.")
+            await update.effective_message.reply_text("❌ Vain ryhmän ylläpitäjä voi asettaa tokenia.")
             return
     else:
         if not await _is_admin(chat_id):
-            await update.message.reply_text("❌ Sinulla ei ole oikeutta määrittää tokenia.")
+            await update.effective_message.reply_text("❌ Sinulla ei ole oikeutta määrittää tokenia.")
             return
 
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Käytä näin:\n\n<code>/config &lt;lyhytaikainen-token&gt;</code>\n\n"
             "Botti vaihtaa tokenin pitkäaikaiseksi (90pv) ja tallentaa sen.",
             parse_mode=ParseMode.HTML,
@@ -512,7 +517,7 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         result = await token_manager.exchange_for_long_lived(token)
     except token_manager.TokenError as e:
-        await update.message.reply_text(f"❌ Tokenin vaihto epäonnistui:\n{e}")
+        await update.effective_message.reply_text(f"❌ Tokenin vaihto epäonnistui:\n{e}")
         return
 
     token_manager.store_token({
@@ -520,7 +525,7 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "expires_at": result.get("expires_at"),
         "source_token": token,
     })
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "✅ Token asetettu! Käytä /paivita päivittääksesi katalogi.",
         parse_mode=ParseMode.HTML,
     )
@@ -532,14 +537,14 @@ async def paivita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_grp:
         if not await _is_chat_admin(update):
-            await update.message.reply_text("❌ Vain ryhmän ylläpitäjä voi päivittää katalogia.")
+            await update.effective_message.reply_text("❌ Vain ryhmän ylläpitäjä voi päivittää katalogia.")
             return
     else:
         if not await _is_admin(chat_id):
-            await update.message.reply_text("❌ Sinulla ei ole oikeutta.")
+            await update.effective_message.reply_text("❌ Sinulla ei ole oikeutta.")
             return
 
-    msg = await update.message.reply_text("Päivitetään katalogia…")
+    msg = await update.effective_message.reply_text("Päivitetään katalogia…")
     await build_catalog()
     await msg.edit_text(
         f"✅ Katalogi päivitetty:\n🏙️ {len(CITIES)} kaupunkia · 🏢 {len(ORGS)} järjestöä · 🔁 {len(CHAINS)} ketjua",
@@ -560,7 +565,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from collections import Counter
         counts = Counter(s["sub_type"] for s in subs)
         lines.append("  " + ", ".join(f"{k}: {v}" for k, v in counts.items()))
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── Callbacks ──────────────────────────────────────────────────────
@@ -823,13 +828,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id not in _org_search_pending:
         return
 
-    query_text = (update.message.text or "").strip()
+    query_text = (update.effective_message.text or "").strip()
     if not query_text:
         return
 
     results = await search_organizations(query_text)
     if not results:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Ei löytynyt järjestöjä haulla. Yritä toisella nimellä tai /peru.",
             parse_mode=ParseMode.HTML,
         )
@@ -845,13 +850,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ])
     buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
     _org_search_pending.discard(chat_id)
-    await update.message.reply_text("Valitse järjestö:", parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text("Valitse järjestö:", parse_mode=ParseMode.HTML,
                                     reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def peru(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _org_search_pending.discard(update.effective_chat.id)
-    await update.message.reply_text("Peruutettu.", reply_markup=await _main_menu())
+    await update.effective_message.reply_text("Peruutettu.", reply_markup=await _main_menu())
 
 
 # ── Listing upcoming demos ─────────────────────────────────────────
@@ -860,7 +865,7 @@ DEMO_LIST_PAGE_SIZE = 20
 
 
 async def listaa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_list_page(update.message.reply_text, 0)
+    await _send_list_page(update.effective_message.reply_text, 0)
 
 
 async def _send_list_page(send_fn, page: int) -> None:
@@ -907,51 +912,21 @@ async def _send_list_page(send_fn, page: int) -> None:
 
 # ── Handler registration ───────────────────────────────────────────
 
-async def _debug_log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    type_ = update.channel_post and "channel_post" or (update.message and "message") or "other"
-    text = ""
-    entities = []
-    if update.message and update.message.text:
-        text = update.message.text
-        entities = [(e.type, e.offset, e.length) for e in (update.message.entities or [])]
-    if update.channel_post and update.channel_post.text:
-        text = update.channel_post.text
-        entities = [(e.type, e.offset, e.length) for e in (update.channel_post.entities or [])]
-    bot = None
-    msg = update.channel_post or update.message
-    if msg:
-        try:
-            bot = msg.get_bot().__class__.__name__ if msg.get_bot() else "NO_BOT"
-        except Exception:
-            bot = "ERR"
-    logger.warning("DEBUG UPDATE: type=%s chat=%s(%s) chat_type=%s text=%s entities=%s bot=%s user=%s",
-                   type_,
-                   chat.username if chat else None,
-                   chat.id if chat else None,
-                   chat.type if chat else None,
-                   text,
-                   entities,
-                   bot,
-                   update.effective_user.id if update.effective_user else None)
-
-
 def build_handlers(app) -> None:
-    app.add_handler(TypeHandler(Update, _debug_log_update))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("tilaa", tilaa))
-    app.add_handler(CommandHandler("listaa", listaa))
-    app.add_handler(CommandHandler("tanaan", tanaan))
-    app.add_handler(CommandHandler("viikolla", viikolla))
-    app.add_handler(CommandHandler("ohjeet", ohjeet))
-    app.add_handler(CommandHandler("config", config))
-    app.add_handler(CommandHandler("paivita", paivita))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("peru", peru))
-    app.add_handler(CommandHandler("ryhma", ryhma))
-    app.add_handler(CommandHandler("liita", liita))
-    app.add_handler(CommandHandler("hallinta", hallinta))
+    app.add_handler(CommandHandler("start", start, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("menu", menu, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("tilaa", tilaa, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("listaa", listaa, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("tanaan", tanaan, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("viikolla", viikolla, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("ohjeet", ohjeet, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("config", config, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("paivita", paivita, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("status", status, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("peru", peru, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("ryhma", ryhma, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("liita", liita, filters=_COMMAND_FILTER))
+    app.add_handler(CommandHandler("hallinta", hallinta, filters=_COMMAND_FILTER))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
