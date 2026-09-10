@@ -41,24 +41,26 @@ async def init_db(db_path: str) -> None:
         cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_links'")
         if await cursor.fetchone():
             await db.execute("ALTER TABLE group_links RENAME TO entity_links")
-            # Check if entity_type column already exists
-            cursor2 = await db.execute("PRAGMA table_info(entity_links)")
-            cols = [row[1] for row in await cursor2.fetchall()]
-            if "entity_type" not in cols:
-                await db.execute("ALTER TABLE entity_links ADD COLUMN entity_type TEXT DEFAULT 'group'")
 
         # Create entity_links if not exists (fresh install)
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS entity_links (
-                user_chat_id  INTEGER NOT NULL,
+                user_chat_id   INTEGER NOT NULL,
                 entity_chat_id INTEGER NOT NULL,
-                entity_type   TEXT DEFAULT 'group',
-                created_at    TEXT DEFAULT (datetime('now')),
+                entity_type    TEXT DEFAULT 'group',
+                created_at     TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (user_chat_id, entity_chat_id)
             );
             """
         )
+
+        # Bring an old-schema entity_links table up to the current columns.
+        cols = [row[1] for row in await (await db.execute("PRAGMA table_info(entity_links)")).fetchall()]
+        if "entity_type" not in cols:
+            await db.execute("ALTER TABLE entity_links ADD COLUMN entity_type TEXT DEFAULT 'group'")
+        if "group_chat_id" in cols and "entity_chat_id" not in cols:
+            await db.execute("ALTER TABLE entity_links RENAME COLUMN group_chat_id TO entity_chat_id")
 
         await db.commit()
 
