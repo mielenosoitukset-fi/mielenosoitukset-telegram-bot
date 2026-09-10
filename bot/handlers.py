@@ -910,18 +910,29 @@ async def _send_list_page(send_fn, page: int) -> None:
 async def _debug_log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     type_ = update.channel_post and "channel_post" or (update.message and "message") or "other"
-    source = (update.channel_post or update.message or update.my_chat_member or update.edited_channel_post) if hasattr(update, "channel_post") else None
     text = ""
+    entities = []
     if update.message and update.message.text:
         text = update.message.text
+        entities = [(e.type, e.offset, e.length) for e in (update.message.entities or [])]
     if update.channel_post and update.channel_post.text:
         text = update.channel_post.text
-    logger.warning("DEBUG UPDATE: type=%s chat=%s(%s) chat_type=%s text=%s user=%s",
+        entities = [(e.type, e.offset, e.length) for e in (update.channel_post.entities or [])]
+    bot = None
+    msg = update.channel_post or update.message
+    if msg:
+        try:
+            bot = msg.get_bot().__class__.__name__ if msg.get_bot() else "NO_BOT"
+        except Exception:
+            bot = "ERR"
+    logger.warning("DEBUG UPDATE: type=%s chat=%s(%s) chat_type=%s text=%s entities=%s bot=%s user=%s",
                    type_,
                    chat.username if chat else None,
                    chat.id if chat else None,
                    chat.type if chat else None,
                    text,
+                   entities,
+                   bot,
                    update.effective_user.id if update.effective_user else None)
 
 
