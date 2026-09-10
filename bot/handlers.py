@@ -12,6 +12,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -906,7 +907,26 @@ async def _send_list_page(send_fn, page: int) -> None:
 
 # ── Handler registration ───────────────────────────────────────────
 
+async def _debug_log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    type_ = update.channel_post and "channel_post" or (update.message and "message") or "other"
+    source = (update.channel_post or update.message or update.my_chat_member or update.edited_channel_post) if hasattr(update, "channel_post") else None
+    text = ""
+    if update.message and update.message.text:
+        text = update.message.text
+    if update.channel_post and update.channel_post.text:
+        text = update.channel_post.text
+    logger.warning("DEBUG UPDATE: type=%s chat=%s(%s) chat_type=%s text=%s user=%s",
+                   type_,
+                   chat.username if chat else None,
+                   chat.id if chat else None,
+                   chat.type if chat else None,
+                   text,
+                   update.effective_user.id if update.effective_user else None)
+
+
 def build_handlers(app) -> None:
+    app.add_handler(TypeHandler(Update, _debug_log_update))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("tilaa", tilaa))
