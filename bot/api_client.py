@@ -95,15 +95,44 @@ async def fetch_all_demos_for_chains(parent_ids: list[str], max_days_till: int =
 
 
 async def search_organizations(query: str) -> list[dict]:
-    """Search organizations by name via the (undocumented) search endpoint."""
+    """Search organizations by name via the public search endpoint."""
     if len(query) < 2:
         return []
     base = settings.api_base_url.replace("/api", "")
-    token = await token_manager.get_active_token()
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{base}/api/v1/search_organizations", params={"q": query}, headers=headers)
+        r = await client.get(f"{base}/api/v1/search_organizations", params={"q": query})
         if r.status_code != 200:
             return []
         data = r.json()
         return data if isinstance(data, list) else []
+
+
+async def fetch_organizations(page: int = 1, per_page: int = 100, search: str = "") -> dict:
+    """List organizations via the public /api/v1/organizations helper.
+
+    Returns an empty dict if the endpoint is not (yet) available.
+    """
+    base = settings.api_base_url.replace("/api", "")
+    params: dict = {"page": page, "per_page": per_page}
+    if search:
+        params["search"] = search
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{base}/api/v1/organizations", params=params)
+        if r.status_code != 200:
+            return {}
+        return r.json()
+
+
+async def fetch_all_organizations(per_page: int = 100) -> list[dict]:
+    """Fetch the full organization catalog; empty list if unavailable."""
+    orgs: list[dict] = []
+    page = 1
+    while True:
+        data = await fetch_organizations(page=page, per_page=per_page)
+        results = data.get("organizations", [])
+        orgs.extend(results)
+        total_pages = data.get("total_pages", 1)
+        if page >= total_pages or not results:
+            break
+        page += 1
+    return orgs

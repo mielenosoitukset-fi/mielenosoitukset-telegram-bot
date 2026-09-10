@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 
+from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder
 
 from . import token_manager
@@ -26,6 +27,14 @@ async def poll_loop(application) -> None:
         await asyncio.sleep(settings.poll_minutes * 60)
 
 
+async def handle_error(update, context) -> None:
+    if isinstance(context.error, BadRequest):
+        message = str(context.error.message or "")
+        if "message is not modified" in message:
+            return
+    logger.error("Unhandled handler error", exc_info=context.error)
+
+
 async def run() -> None:
     await init_db(settings.db_path)
     await set_admin_from_env(settings.admin_chat_ids)
@@ -41,6 +50,7 @@ async def run() -> None:
         .build()
     )
     build_handlers(application)
+    application.add_error_handler(handle_error)
 
     # Periodic catalog refresh + polling
     application.job_queue.run_repeating(lambda ctx: periodic_refresh_catalog(), interval=settings.poll_minutes * 60, first=0)

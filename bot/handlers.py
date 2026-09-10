@@ -16,7 +16,12 @@ from telegram.ext import (
 )
 
 from . import token_manager
-from .api_client import fetch_demo_detail, fetch_all_upcoming_demos, search_organizations
+from .api_client import (
+    fetch_demo_detail,
+    fetch_all_upcoming_demos,
+    fetch_all_organizations,
+    search_organizations,
+)
 from .cities import CITIES
 from .notifications import format_demo_compact
 from .database import (
@@ -36,8 +41,15 @@ logger = logging.getLogger(__name__)
 ORGS: list[dict] = []       # {id, name}
 CHAINS: list[dict] = []     # {id, title}
 
-# Pending org-search state per chat
+# Pending search state per chat
 _org_search_pending: set[int] = set()
+_city_search_pending: set[int] = set()
+_city_search_term: dict[int, str] = {}
+_entity_city_search_pending: dict[int, int] = {}  # user chat -> entity gid
+_entity_city_search_term: dict[int, str] = {}
+
+CITY_PAGE_SIZE = 20
+CITY_SEARCH_MAX = 25
 
 # Pending entity pairing: code -> {entity_chat_id, entity_title, entity_type, created_at}
 _pending_pairing: dict[str, dict] = {}
@@ -110,6 +122,14 @@ async def build_catalog(max_days_till: int = 180) -> None:
         chain_set: dict[str, str] = {}
         org_map: dict[str, str] = {}
 
+        # Prefer the public organization listing endpoint when it is available
+        # (deployed on the live backend). Fall back to scraping demo details.
+        for org in await fetch_all_organizations():
+            oid = org.get("id") or org.get("organization_id")
+            name = org.get("name")
+            if oid and name:
+                org_map.setdefault(str(oid), name)
+
         for d in demos[:100]:
             demo_id = d.get("_id") or d.get("id")
             if not demo_id:
@@ -121,11 +141,12 @@ async def build_catalog(max_days_till: int = 180) -> None:
             parent = detail.get("parent")
             if parent:
                 chain_set[str(parent)] = detail.get("title") or "Ketju"
-            for org in detail.get("organizers") or []:
-                oid = org.get("organization_id") or org.get("id")
-                name = org.get("name")
-                if oid and name:
-                    org_map.setdefault(str(oid), name)
+            if not org_map:
+                for org in detail.get("organizers") or []:
+                    oid = org.get("organization_id") or org.get("id")
+                    name = org.get("name")
+                    if oid and name:
+                        org_map.setdefault(str(oid), name)
 
         CHAINS = sorted(
             [{"id": pid, "title": title} for pid, title in chain_set.items()],
@@ -191,14 +212,73 @@ async def _overview(chat_id: int, chat_title: str, is_entity: bool = False) -> s
     return "\n".join(lines)
 
 
-async def _city_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "city")}
-    buttons = [
-        [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}", callback_data=f"city:{c}")]
-        for c in CITIES
+def _city_letters() -> list[str]:
+    return sorted({c[0].upper() for c in CITIES})
+
+
+def _cities_starting(letter: str) -> list[str]:
+    return [c for c in CITIES if c[0].upper() == letter]
+
+
+def _city_matches(term: str) -> list[str]:
+    needle = term.casefold()
+    return [c for c in CITIES if needle in c.casefold()]
+
+
+def _city_alphabet_markup(page_cb: str, search_cb: str, back_cb: str) -> InlineKeyboardMarkup:
+    letters = _city_letters()
+    rows = [
+        [InlineKeyboardButton(ch, callback_data=f"{page_cb}:{ch}:0") for ch in letters[i:i + 8]]
+        for i in range(0, len(letters), 8)
     ]
-    buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
-    return InlineKeyboardMarkup(buttons)
+    rows.append([InlineKeyboardButton("🔍 Hae kaupunkia", callback_data=search_cb)])
+    rows.append([InlineKeyboardButton("◀️ Takaisin", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _city_page_markup(
+    chat_id: int,
+    page_cb: str,
+    tog_cb: str,
+    letter: str,
+    page: int,
+    search_cb: str,
+    alphabet_cb: str,
+    back_cb: str,
+) -> InlineKeyboardMarkup:
+    subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "city")}
+    city_list = _cities_starting(letter)
+    total_pages = max(1, (len(city_list) + CITY_PAGE_SIZE - 1) // CITY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = city_list[page * CITY_PAGE_SIZE:(page + 1) * CITY_PAGE_SIZE]
+    rows = [
+        [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}",
+                              callback_data=f"{tog_cb}:{letter}:{page}:{c}")]
+        for c in chunk
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"{page_cb}:{letter}:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{letter} · {page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"{page_cb}:{letter}:{page + 1}"))
+    rows.append(nav)
+    if len(city_list) > CITY_PAGE_SIZE:
+        rows.append([InlineKeyboardButton("🔍 Hae kaupunkia", callback_data=search_cb)])
+    rows.append([InlineKeyboardButton("🔁 Kirjaimet", callback_data=alphabet_cb),
+                 InlineKeyboardButton("◀️ Takaisin", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _city_search_markup(chat_id: int, term: str, tog_cb: str, back_cb: str) -> InlineKeyboardMarkup:
+    subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "city")}
+    rows = [
+        [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}",
+                              callback_data=f"{tog_cb}:{c}")]
+        for c in _city_matches(term)[:CITY_SEARCH_MAX]
+    ]
+    rows.append([InlineKeyboardButton("◀️ Takaisin", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _org_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -578,6 +658,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_title = get_chat_title(update)
     is_entity = _is_group(update) or _is_channel(update)
 
+    if data == "noop":
+        return
+
     if data == "back_menu":
         await query.edit_message_text(
             await _overview(chat_id, chat_title, is_entity=is_entity),
@@ -595,8 +678,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if data == "cities":
-        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=await _city_keyboard(chat_id))
+        await query.edit_message_text("🏙️ <b>Valitse kaupunki (aakkosittain):</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=_city_alphabet_markup("city_page", "city_search", "back_menu"))
         return
     if data == "orgs":
         await query.edit_message_text("🏢 <b>Valitse järjestö (tai etsi):</b>", parse_mode=ParseMode.HTML,
@@ -677,36 +760,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Entity subscription toggles
-    if data.startswith("ent_city:"):
-        gid = int(data.split(":")[1])
-        subs = {s["sub_key"] for s in await get_subscriptions(gid, "city")}
-        buttons = [
-            [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}",
-                                  callback_data=f"ent_city_tog:{gid}:{c}")]
-            for c in CITIES
-        ]
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
-        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("ent_city_tog:"):
-        parts = data.split(":", 2)
-        gid, city = int(parts[1]), parts[2]
+    if data.startswith("ent_city_sr:"):
+        _, gid, city = data.split(":", 2)
+        gid = int(gid)
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "city")}
         if city in subs:
             await remove_subscription(gid, "city", city)
         else:
             await add_subscription(gid, "", "city", city, city)
+        term = _entity_city_search_term.get(chat_id, "")
+        await query.edit_message_text(f"🔍 <b>Haku: {term}</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _city_search_markup(gid, term, f"ent_city_sr:{gid}", f"ent_city:{gid}"))
+        return
+
+    if data.startswith("ent_city_search:"):
+        gid = int(data.split(":")[1])
+        _entity_city_search_pending[chat_id] = gid
+        await query.edit_message_text(
+            "Kirjoita kaupungin nimi (vähintään 2 merkkiä).\n"
+            "Peruuta kirjoittamalla /peru.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("ent_city_page:"):
+        _, gid, letter, page = data.split(":", 3)
+        gid = int(gid)
+        await query.edit_message_text(f"🏙️ <b>Valitse kaupunki · {letter}</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _city_page_markup(
+                                          gid, f"ent_city_page:{gid}", f"ent_city_tog:{gid}", letter,
+                                          int(page), f"ent_city_search:{gid}", f"ent_city:{gid}", f"entity:{gid}"))
+        return
+
+    if data.startswith("ent_city_tog:"):
+        _, gid, letter, page, city = data.split(":", 4)
+        gid = int(gid)
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "city")}
-        buttons = [
-            [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}",
-                                  callback_data=f"ent_city_tog:{gid}:{c}")]
-            for c in CITIES
-        ]
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
-        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=InlineKeyboardMarkup(buttons))
+        if city in subs:
+            await remove_subscription(gid, "city", city)
+        else:
+            await add_subscription(gid, "", "city", city, city)
+        await query.edit_message_text(f"🏙️ <b>Valitse kaupunki · {letter}</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _city_page_markup(
+                                          gid, f"ent_city_page:{gid}", f"ent_city_tog:{gid}", letter,
+                                          int(page), f"ent_city_search:{gid}", f"ent_city:{gid}", f"entity:{gid}"))
+        return
+
+    if data.startswith("ent_city:"):
+        gid = int(data.split(":")[1])
+        await query.edit_message_text("🏙️ <b>Valitse kaupunki (aakkosittain):</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=_city_alphabet_markup(
+                                          f"ent_city_page:{gid}", f"ent_city_search:{gid}", f"entity:{gid}"))
         return
 
     if data.startswith("ent_org:"):
@@ -782,13 +886,43 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Direct chat subscription toggles
-    if data.startswith("city:"):
+    if data.startswith("city_sr:"):
         city = data.split(":", 1)[1]
         added = await add_subscription(chat_id, chat_title, "city", city, city)
         if not added:
             await remove_subscription(chat_id, "city", city)
-        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=await _city_keyboard(chat_id))
+        term = _city_search_term.get(chat_id, "")
+        await query.edit_message_text(f"🔍 <b>Haku: {term}</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _city_search_markup(chat_id, term, "city_sr", "cities"))
+        return
+
+    if data == "city_search":
+        _city_search_pending.add(chat_id)
+        _org_search_pending.discard(chat_id)
+        await query.edit_message_text(
+            "Kirjoita kaupungin nimi (vähintään 2 merkkiä).\n"
+            "Peruuta kirjoittamalla /peru.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("city_page:"):
+        _, letter, page = data.split(":", 2)
+        await query.edit_message_text(f"🏙️ <b>Valitse kaupunki · {letter}</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _city_page_markup(
+                                          chat_id, "city_page", "city_tog", letter,
+                                          int(page), "city_search", "cities", "back_menu"))
+        return
+
+    if data.startswith("city_tog:"):
+        _, letter, page, city = data.split(":", 3)
+        added = await add_subscription(chat_id, chat_title, "city", city, city)
+        if not added:
+            await remove_subscription(chat_id, "city", city)
+        await query.edit_message_text(f"🏙️ <b>Valitse kaupunki · {letter}</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _city_page_markup(
+                                          chat_id, "city_page", "city_tog", letter,
+                                          int(page), "city_search", "cities", "back_menu"))
         return
 
     if data.startswith("org:"):
@@ -825,37 +959,77 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if chat_id not in _org_search_pending:
-        return
-
     query_text = (update.effective_message.text or "").strip()
     if not query_text:
         return
 
-    results = await search_organizations(query_text)
-    if not results:
-        await update.effective_message.reply_text(
-            "Ei löytynyt järjestöjä haulla. Yritä toisella nimellä tai /peru.",
-            parse_mode=ParseMode.HTML,
-        )
+    # Organization search
+    if chat_id in _org_search_pending:
+        results = await search_organizations(query_text)
+        if not results:
+            await update.effective_message.reply_text(
+                "Ei löytynyt järjestöjä haulla. Yritä toisella nimellä tai /peru.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "org")}
+        buttons = []
+        for org in results[:10]:
+            mark = "✅" if org.get("id") in subs else "➕"
+            buttons.append([
+                InlineKeyboardButton(f"{mark} {org.get('name')}",
+                                     callback_data=f"org:{org.get('id')}:{org.get('name')}")
+            ])
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
+        _org_search_pending.discard(chat_id)
+        await update.effective_message.reply_text("Valitse järjestö:", parse_mode=ParseMode.HTML,
+                                                  reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "org")}
-    buttons = []
-    for org in results[:10]:
-        mark = "✅" if org.get("id") in subs else "➕"
-        buttons.append([
-            InlineKeyboardButton(f"{mark} {org.get('name')}",
-                                 callback_data=f"org:{org.get('id')}:{org.get('name')}")
-        ])
-    buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
-    _org_search_pending.discard(chat_id)
-    await update.effective_message.reply_text("Valitse järjestö:", parse_mode=ParseMode.HTML,
-                                    reply_markup=InlineKeyboardMarkup(buttons))
+    # Own-chat city search
+    if chat_id in _city_search_pending:
+        if len(query_text) < 2:
+            await update.effective_message.reply_text(
+                "Anna vähintään 2 merkkiä.", parse_mode=ParseMode.HTML)
+            return
+        if not _city_matches(query_text):
+            await update.effective_message.reply_text(
+                "Ei kaupunkeja haulla. Yritä toisella nimellä tai /peru.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        _city_search_term[chat_id] = query_text
+        await update.effective_message.reply_text(f"🔍 <b>Haku: {query_text}</b>", parse_mode=ParseMode.HTML,
+                                                  reply_markup=await _city_search_markup(chat_id, query_text, "city_sr", "cities"))
+        return
+
+    # Entity city search (via /hallinta)
+    gid = _entity_city_search_pending.get(chat_id)
+    if gid is not None:
+        if len(query_text) < 2:
+            await update.effective_message.reply_text(
+                "Anna vähintään 2 merkkiä.", parse_mode=ParseMode.HTML)
+            return
+        if not _city_matches(query_text):
+            await update.effective_message.reply_text(
+                "Ei kaupunkeja haulla. Yritä toisella nimellä tai /peru.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        _entity_city_search_term[chat_id] = query_text
+        await update.effective_message.reply_text(f"🔍 <b>Haku: {query_text}</b>", parse_mode=ParseMode.HTML,
+                                                  reply_markup=await _city_search_markup(gid, query_text, f"ent_city_sr:{gid}", f"ent_city:{gid}"))
+        return
 
 
 async def peru(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _org_search_pending.discard(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    _org_search_pending.discard(chat_id)
+    _city_search_pending.discard(chat_id)
+    _city_search_term.pop(chat_id, None)
+    _entity_city_search_pending.pop(chat_id, None)
+    _entity_city_search_term.pop(chat_id, None)
     await update.effective_message.reply_text("Peruutettu.", reply_markup=await _main_menu())
 
 
