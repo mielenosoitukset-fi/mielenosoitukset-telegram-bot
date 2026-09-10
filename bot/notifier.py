@@ -82,7 +82,7 @@ async def poll_and_notify(bot: Bot) -> None:
             if await is_seen(chat_id, demo_id):
                 continue
             try:
-                await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
+                await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
                 await mark_seen(chat_id, demo_id)
                 sent += 1
             except Exception:

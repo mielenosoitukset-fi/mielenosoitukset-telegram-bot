@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+
 import httpx
 
 from .config import settings
 from . import token_manager
+
+logger = logging.getLogger(__name__)
 
 
 async def _get(path: str, params: dict | None = None) -> dict | list | None:
@@ -23,9 +27,11 @@ async def fetch_upcoming_demos(
     parent_id: str | None = None,
     max_days_till: int = 14,
     per_page: int = 50,
-) -> list[dict]:
+    page: int = 1,
+) -> dict:
     params: dict = {
         "per_page": per_page,
+        "page": page,
         "in_past": "false",
         "max_days_till": max_days_till,
         "include_cancelled": "false",
@@ -39,8 +45,25 @@ async def fetch_upcoming_demos(
 
     data = await _get("/demonstrations", params)
     if not data:
-        return []
-    return data.get("results", [])
+        return {"results": [], "total": 0, "total_pages": 0, "page": 1}
+    return data
+
+
+async def fetch_all_upcoming_demos(
+    max_days_till: int = 90,
+    per_page: int = 100,
+) -> list[dict]:
+    all_demos: list[dict] = []
+    page = 1
+    while True:
+        data = await fetch_upcoming_demos(max_days_till=max_days_till, per_page=per_page, page=page)
+        results = data.get("results", [])
+        all_demos.extend(results)
+        total_pages = data.get("total_pages", 1)
+        if page >= total_pages or not results:
+            break
+        page += 1
+    return all_demos
 
 
 async def fetch_demo_detail(demo_id: str) -> dict:
@@ -49,33 +72,25 @@ async def fetch_demo_detail(demo_id: str) -> dict:
 
 
 async def fetch_all_demos_for_orgs(org_ids: list[str], max_days_till: int = 14) -> list[dict]:
-    all_demos = []
+    all_demos: list[dict] = []
     for org_id in org_ids:
-        demos = await fetch_upcoming_demos(organization_id=org_id, max_days_till=max_days_till)
-        all_demos.extend(demos)
+        demos_data = await fetch_upcoming_demos(organization_id=org_id, max_days_till=max_days_till)
+        all_demos.extend(demos_data.get("results", []))
     return all_demos
 
 
 async def fetch_all_demos_for_cities(cities: list[str], max_days_till: int = 14) -> list[dict]:
     if not cities:
         return []
-    params: dict = {
-        "per_page": 50,
-        "in_past": "false",
-        "max_days_till": max_days_till,
-        "city": ",".join(cities),
-    }
-    data = await _get("/demonstrations", params)
-    if not data:
-        return []
+    data = await fetch_upcoming_demos(city=",".join(cities), max_days_till=max_days_till)
     return data.get("results", [])
 
 
 async def fetch_all_demos_for_chains(parent_ids: list[str], max_days_till: int = 14) -> list[dict]:
-    all_demos = []
+    all_demos: list[dict] = []
     for pid in parent_ids:
-        demos = await fetch_upcoming_demos(parent_id=pid, max_days_till=max_days_till)
-        all_demos.extend(demos)
+        demos_data = await fetch_upcoming_demos(parent_id=pid, max_days_till=max_days_till)
+        all_demos.extend(demos_data.get("results", []))
     return all_demos
 
 

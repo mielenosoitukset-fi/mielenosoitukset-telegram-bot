@@ -54,7 +54,9 @@ async def run() -> None:
             ("tanaan", "Tänään tapahtuvat"),
             ("viikolla", "Tällä viikolla"),
             ("menu", "Avaa päävalikko"),
-            ("ryhma", "Liitä ryhmä DM:ään"),
+            ("ryhma", "Liitä ryhmä/kanava DM:ään"),
+            ("liita", "Liitä koodilla"),
+            ("hallinta", "Hallitse liitetyt ryhmät/kanavat"),
             ("config", "Aseta API-token (ylläpitäjä)"),
             ("paivita", "Päivitä katalogi (ylläpitäjä)"),
             ("status", "Tarkista botin tila"),
@@ -68,7 +70,10 @@ async def run() -> None:
             loop.add_signal_handler(sig, stop.set)
         poll_task = asyncio.create_task(poll_loop(application))
         await application.start()
-        await application.updater.start_polling()
+        await application.updater.start_polling(allowed_updates=[
+            "message", "edited_message", "channel_post", "edited_channel_post",
+            "callback_query", "my_chat_member", "chat_member",
+        ])
         try:
             await stop.wait()
         finally:

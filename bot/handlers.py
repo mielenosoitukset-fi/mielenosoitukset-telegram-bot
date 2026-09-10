@@ -16,7 +16,8 @@ from telegram.ext import (
 )
 
 from . import token_manager
-from .api_client import fetch_demo_detail, fetch_upcoming_demos, search_organizations
+from .api_client import fetch_demo_detail, fetch_all_upcoming_demos, search_organizations
+from .cities import CITIES
 from .notifications import format_demo_compact
 from .database import (
     add_subscription,
@@ -25,21 +26,20 @@ from .database import (
     is_bootstrapped,
     get_subscriptions,
     remove_subscription,
-    link_group,
-    get_linked_groups,
+    link_entity,
+    get_linked_entities,
 )
 
 logger = logging.getLogger(__name__)
 
-# Cached catalogs
-CITIES: list[str] = []
-ORGS: list[dict] = []
-CHAINS: list[dict] = []
+# Cached catalogs (refreshed by the poller on a schedule)
+ORGS: list[dict] = []       # {id, name}
+CHAINS: list[dict] = []     # {id, title}
 
 # Pending org-search state per chat
 _org_search_pending: set[int] = set()
 
-# Pending group pairing: code -> {group_chat_id, group_title, created_at}
+# Pending entity pairing: code -> {entity_chat_id, entity_title, entity_type, created_at}
 _pending_pairing: dict[str, dict] = {}
 
 PAIRING_CODE_TTL = 600  # 10 minutes
@@ -98,18 +98,15 @@ def _cleanup_pending_pairing() -> None:
 
 # ── Catalog builders ───────────────────────────────────────────────
 
-async def build_catalog(max_days_till: int = 60) -> None:
-    global CITIES, ORGS, CHAINS
+async def build_catalog(max_days_till: int = 180) -> None:
+    global ORGS, CHAINS
     try:
-        demos = await fetch_upcoming_demos(max_days_till=max_days_till, per_page=100)
-        city_set = {d.get("city") for d in demos if d.get("city")}
-        if city_set:
-            CITIES = sorted(city_set)
+        demos = await fetch_all_upcoming_demos(max_days_till=max_days_till, per_page=100)
 
         chain_set: dict[str, str] = {}
         org_map: dict[str, str] = {}
 
-        for d in demos[:30]:
+        for d in demos[:100]:
             demo_id = d.get("_id") or d.get("id")
             if not demo_id:
                 continue
@@ -126,15 +123,21 @@ async def build_catalog(max_days_till: int = 60) -> None:
                 if oid and name:
                     org_map.setdefault(str(oid), name)
 
-        CHAINS = [{"id": pid, "title": title} for pid, title in chain_set.items()]
-        ORGS = [{"id": oid, "name": name} for oid, name in org_map.items()]
+        CHAINS = sorted(
+            [{"id": pid, "title": title} for pid, title in chain_set.items()],
+            key=lambda c: c["title"],
+        )
+        ORGS = sorted(
+            [{"id": oid, "name": name} for oid, name in org_map.items()],
+            key=lambda o: o["name"],
+        )
     except Exception:
         logger.exception("Failed to build catalog")
 
 
 # ── Menu builders ──────────────────────────────────────────────────
 
-async def _main_menu(is_group: bool = False) -> InlineKeyboardMarkup:
+async def _main_menu(is_group_or_channel: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 Tulevat", callback_data="list:0")],
         [InlineKeyboardButton("🏙️ Kaupungit", callback_data="cities"),
@@ -142,36 +145,36 @@ async def _main_menu(is_group: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔁 Ketjut", callback_data="chains"),
          InlineKeyboardButton("ℹ️ Ohjeet", callback_data="help")],
     ]
-    if is_group:
-        rows.insert(0, [InlineKeyboardButton("⚙️ Ryhmäasetukset (DM)", callback_data="group_settings")])
+    if is_group_or_channel:
+        rows.insert(0, [InlineKeyboardButton("⚙️ Hallinta (DM)", callback_data="go_hallinta")])
     return InlineKeyboardMarkup(rows)
 
 
-async def _overview(chat_id: int, chat_title: str, is_group: bool = False) -> str:
+async def _overview(chat_id: int, chat_title: str, is_entity: bool = False) -> str:
     subs = await get_subscriptions(chat_id)
     if not subs:
-        if is_group:
+        if is_entity:
             return (
-                f"*{chat_title}*\n\n"
+                f"<b>{chat_title}</b>\n\n"
                 "Tilaa mielenosoituksia kaupungin, järjestön tai ketjun mukaan.\n"
                 "Valitse alta tai käytä komentoja:\n"
                 "  /tanaan – tänään\n"
                 "  /viikolla – tällä viikolla\n"
                 "  /listaa – kaikki tulevat\n"
                 "  /tilaa – hallitse tilauksia\n\n"
-                "Ylläpitäjä voi hallita asetuksia DM:stä komennolla /liita."
+                "Ylläpitäjä voi hallita asetuksia DM:stä komennolla /ryhma."
             )
         return (
-            f"*{chat_title}*\n\n"
+            f"<b>{chat_title}</b>\n\n"
             "Tilaa mielenosoituksia kaupungin, järjestön tai ketjun mukaan.\n\n"
             "Valitse alta:\n"
-            "🏙️ *Kaupungit* – kaikki mielenosoitukset kaupungissa\n"
-            "🏢 *Järjestöt* – tietyn järjestön järjestämät\n"
-            "🔁 *Ketjut* – toistuvat mielenosoitusketjut\n\n"
+            "🏙️ <b>Kaupungit</b> – kaikki mielenosoitukset kaupungissa\n"
+            "🏢 <b>Järjestöt</b> – tietyn järjestön järjestämät\n"
+            "🔁 <b>Ketjut</b> – toistuvat mielenosoitusketjut\n\n"
             "Tai komentoilla: /tanaan, /viikolla, /listaa, /tilaa"
         )
 
-    lines = [f"*{chat_title} – tilauksesi:*\n"]
+    lines = [f"<b>{chat_title} – tilauksesi:</b>\n"]
     city = [s["sub_label"] for s in subs if s["sub_type"] == "city"]
     org = [s["sub_label"] for s in subs if s["sub_type"] == "org"]
     chain = [s["sub_label"] for s in subs if s["sub_type"] == "chain"]
@@ -197,7 +200,7 @@ async def _city_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 async def _org_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "org")}
     buttons = []
-    for org in ORGS[:30]:
+    for org in ORGS:
         mark = "✅" if org["id"] in subs else "➕"
         buttons.append([
             InlineKeyboardButton(f"{mark} {org['name']}",
@@ -211,10 +214,10 @@ async def _org_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 async def _chain_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "chain")}
     buttons = []
-    for chain in CHAINS[:30]:
+    for chain in CHAINS:
         mark = "✅" if chain["id"] in subs else "➕"
         buttons.append([
-            InlineKeyboardButton(f"{mark} {chain['title'][:40]}",
+            InlineKeyboardButton(f"{mark} {chain['title'][:50]}",
                                  callback_data=f"chain:{chain['id']}:{chain['title']}")
         ])
     buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
@@ -224,7 +227,6 @@ async def _chain_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 # ── Time-filtered listings ─────────────────────────────────────────
 
 def _parse_date(d: dict) -> datetime | None:
-    """Extract datetime from a demo dict."""
     for key in ("start", "date", "start_time"):
         val = d.get(key)
         if val:
@@ -243,12 +245,11 @@ def _filter_demos(demos: list[dict], *, today: bool = False, this_week: bool = F
     for d in demos:
         dt = _parse_date(d)
         if dt is None:
-            filtered.append(d)  # no date = keep
+            filtered.append(d)
             continue
         if today and dt.date() == now.date():
             filtered.append(d)
         elif this_week:
-            # Mon–Sun of current week
             start_of_week = now - timedelta(days=now.weekday())
             end_of_week = start_of_week + timedelta(days=7)
             if start_of_week.date() <= dt.date() < end_of_week.date():
@@ -258,19 +259,16 @@ def _filter_demos(demos: list[dict], *, today: bool = False, this_week: bool = F
 
 async def _send_filtered_listing(send_fn, demos: list[dict], title: str) -> None:
     if not demos:
-        await send_fn(f"Ei mielenosoituksia: {title}.", parse_mode=ParseMode.MARKDOWN)
+        await send_fn(f"Ei mielenosoituksia: {title}.", parse_mode=ParseMode.HTML)
         return
 
-    lines = [f"*{title}* ({len(demos)} kpl)\n"]
+    lines = [f"<b>{title}</b> ({len(demos)} kpl)\n"]
     for d in demos[:30]:
         lines.append(format_demo_compact(d))
 
     await send_fn(
         "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Päivitä", callback_data=f"refresh:{title}")]
-        ]),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -280,6 +278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     is_grp = _is_group(update)
     is_ch = _is_channel(update)
+    is_entity = is_grp or is_ch
 
     if is_ch:
         await update.message.reply_text("✅ Mielenosoitukset.fi -botti kanavalla.")
@@ -287,65 +286,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_grp:
         text = (
-            f"*{get_chat_title(update)}*\n\n"
+            f"<b>{get_chat_title(update)}</b>\n\n"
             "Tilaa mielenosoituksia kaupungin, järjestön tai ketjun mukaan.\n"
             "Käytä /tilaa hallitaksesi tilauksia.\n\n"
             "Pikakäskyt:\n"
             "  /tanaan – tänään tapahtuvat\n"
             "  /viikolla – tällä viikolla\n"
             "  /listaa – kaikki tulevat\n\n"
-            "Ylläpitäjä voi hallita asetuksia DM:stä komennolla /liita."
+            "Ylläpitäjä voi hallita asetuksia DM:stä komennolla /ryhma."
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
         return
 
     if not await is_bootstrapped():
         await add_admin(chat_id)
         text = (
-            "*Tervetuloa!*\n\n"
+            "<b>Tervetuloa!</b>\n\n"
             "Olet bottin ensimmäinen käyttäjä ja sait automaattisesti "
             "ylläpitäjän oikeudet.\n\n"
             "Käytä /config asettaaksesi API-tokenin.\n"
             "Sitten voit tilata mielenosoituksia alta."
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML,
                                         reply_markup=await _main_menu())
         return
 
     text = await _overview(chat_id, get_chat_title(update))
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
                                     reply_markup=await _main_menu())
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    is_grp = _is_group(update)
-    text = await _overview(chat_id, get_chat_title(update), is_group=is_grp)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=await _main_menu(is_group=is_grp))
+    is_entity = _is_group(update) or _is_channel(update)
+    text = await _overview(chat_id, get_chat_title(update), is_entity=is_entity)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                    reply_markup=await _main_menu(is_group_or_channel=is_entity))
 
 
 async def tilaa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show subscription management menu."""
     await menu(update, context)
 
 
 async def ohjeet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "*Ohjeet*\n\n"
-        "🏙️ *Kaupungit* – ilmoitus kaikista mielenosoituksista kaupungissa\n"
-        "🏢 *Järjestöt* – ilmoitus tietyn järjestön järjestämistä\n"
-        "🔁 *Ketjut* – ilmoitus toistuvista mielenosoitusketjuista\n\n"
-        "*Pikakäskyt:*\n"
+        "<b>Ohjeet</b>\n\n"
+        "🏙️ <b>Kaupungit</b> – ilmoitus kaikista mielenosoituksista kaupungissa\n"
+        "🏢 <b>Järjestöt</b> – ilmoitus tietyn järjestön järjestämistä\n"
+        "🔁 <b>Ketjut</b> – ilmoitus toistuvista mielenosoitusketjuista\n\n"
+        "<b>Pikakäskyt:</b>\n"
         "  /tanaan – tänään tapahtuvat\n"
         "  /viikolla – tällä viikolla tapahtuvat\n"
         "  /listaa – kaikki tulevat\n"
         "  /tilaa – hallitse tilauksia\n\n"
-        "*Ryhmille:*\n"
-        "Ylläpitäjä voi liittää DM:nsä ryhmään komennolla /liita.\n"
-        "Sen jälkeen hallitse ryhmän tilauksia suoraan DM:stä."
+        "<b>Ryhmiin ja kanaviin:</b>\n"
+        "Ylläpitäjä voi liittää DM:nsä komennolla /ryhma."
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ── Quick-filter commands ──────────────────────────────────────────
@@ -356,7 +353,7 @@ async def tanaan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg = await update.message.reply_text("Haetaan…")
     try:
-        demos = await fetch_upcoming_demos(max_days_till=1, per_page=100)
+        demos = await fetch_all_upcoming_demos(max_days_till=1, per_page=100)
         today = _filter_demos(demos, today=True)
         await msg.delete()
         await _send_filtered_listing(update.message.reply_text, today, "Tänään")
@@ -371,7 +368,7 @@ async def viikolla(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg = await update.message.reply_text("Haetaan…")
     try:
-        demos = await fetch_upcoming_demos(max_days_till=14, per_page=100)
+        demos = await fetch_all_upcoming_demos(max_days_till=14, per_page=100)
         this_week = _filter_demos(demos, this_week=True)
         await msg.delete()
         await _send_filtered_listing(update.message.reply_text, this_week, "Tällä viikolla")
@@ -380,40 +377,42 @@ async def viikolla(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text("❌ Haku epäonnistui.")
 
 
-# ── Group pairing ──────────────────────────────────────────────────
+# ── Group/channel pairing ──────────────────────────────────────────
 
 async def ryhma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate a pairing code for a group. Must be sent IN the group."""
-    if not _is_group(update):
+    """Generate a pairing code. Works in groups AND channels."""
+    if not (_is_group(update) or _is_channel(update)):
         await update.message.reply_text(
-            "Käytä tätä komentoa ryhmässä, jonka haluat liittää DM:ään.\n"
-            "Siirry ryhmään ja lähetä /ryhma siellä."
+            "Käytä tätä komentoa ryhmässä tai kanavassa, jonka haluat liittää DM:ään.\n"
+            "Siirry ryhmään/kanavaan ja lähetä /ryhma siellä."
         )
         return
 
     if not await _is_chat_admin(update):
-        await update.message.reply_text("❌ Vain ryhmän ylläpitäjä voi liittää ryhmän.")
+        await update.message.reply_text("❌ Vain ylläpitäjä voi liittää ryhmän/kanavan.")
         return
 
     _cleanup_pending_pairing()
     code = secrets.token_urlsafe(4).upper()
+    entity_type = "channel" if _is_channel(update) else "group"
     _pending_pairing[code] = {
-        "group_chat_id": update.effective_chat.id,
-        "group_title": get_chat_title(update),
+        "entity_chat_id": update.effective_chat.id,
+        "entity_title": get_chat_title(update),
+        "entity_type": entity_type,
         "created_at": time.time(),
     }
     await update.message.reply_text(
-        f"*Liittämislinkki luotu!*\n\n"
-        f"Koodi: `{code}`\n\n"
+        f"<b>Liittämislinkki luotu!</b>\n\n"
+        f"Koodi: <code>{code}</code>\n\n"
         f"Siirry botin DM-chattiin ja lähetä:\n"
-        f"`/liita {code}`\n\n"
+        f"<code>/liita {code}</code>\n\n"
         f"Koodi on voimassa 10 minuuttia.",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def liita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Link a group to this DM chat. Must be sent in DM."""
+    """Link a group/channel to this DM chat. Must be sent in DM."""
     if not _is_private(update):
         await update.message.reply_text("Käytä tätä komentoa botin DM-chattissa.")
         return
@@ -421,9 +420,9 @@ async def liita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Käytä näin: `/liita <koodi>`\n\n"
-            "Hanki koodi ryhmässä komennolla /ryhma.",
-            parse_mode=ParseMode.MARKDOWN,
+            "Käytä näin: <code>/liita &lt;koodi&gt;</code>\n\n"
+            "Hanki koodi ryhmässä/kanavassa komennolla /ryhma.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -433,55 +432,53 @@ async def liita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if code not in _pending_pairing:
         await update.message.reply_text(
             "❌ Kelvoton tai vanhentunut koodi.\n"
-            "Pyydä ryhmän ylläpitäjää luomaan uusi koodi komennolla /ryhma ryhmässä."
+            "Pyydä ylläpitäjää luomaan uusi koodi komennolla /ryhma ryhmässä/kanavassa."
         )
         return
 
     info = _pending_pairing.pop(code)
     user_id = update.effective_chat.id
-    await link_group(user_id, info["group_chat_id"], info["group_title"])
-
-    # Also make user an admin for the group
-    await add_admin(info["group_chat_id"])
+    await link_entity(user_id, info["entity_chat_id"], info["entity_type"], info["entity_title"])
 
     await update.message.reply_text(
-        f"✅ *Ryhmä liitetty!*\n\n"
-        f"Ryhmä: {info['group_title']}\n\n"
-        f"Nyt voit hallita ryhmän tilauksia täältä DM:stä.\n"
-        f"Käytä /ryhma_listaa nähdäksesi ryhmän tilaukset.\n"
-        f"Tai käytä /tilaa_valitse valitaksesi ryhmän.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"<b>Liitetty!</b>\n\n"
+        f"Tyyppi: {info['entity_type']}\n"
+        f"Nimi: {info['entity_title']}\n\n"
+        f"Nyt voit hallita tilauksia täältä DM:stä.\n"
+        f"Käytä /hallinta nähdäksesi liitetyt ryhmät ja kanavat.",
+        parse_mode=ParseMode.HTML,
     )
 
 
-async def ryhma_listaa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List subscriptions for linked groups."""
+async def hallinta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all linked groups and channels."""
     if not _is_private(update):
         return
 
-    groups = await get_linked_groups(update.effective_chat.id)
-    if not groups:
+    entities = await get_linked_entities(update.effective_chat.id)
+    if not entities:
         await update.message.reply_text(
-            "Et ole liittänyt yhtään ryhmää.\n"
-            "Liitä ryhmä komennolla /liita <koodi> (koodi saadaan ryhmässä /ryhma)."
+            "Et ole liittänyt yhtään ryhmää tai kanavaa.\n"
+            "Liitä ryhmä/kanava komennolla /ryhma siellä, sitten /liita <koodi> tässä."
         )
         return
 
     buttons = []
-    for gid in groups:
-        subs = await get_subscriptions(gid)
+    for ent in entities:
+        subs = await get_subscriptions(ent["chat_id"])
         count = len(subs)
-        title = subs[0]["chat_title"] if subs else str(gid)
+        title = subs[0]["chat_title"] if subs else str(ent["chat_id"])
+        icon = "📢" if ent["type"] == "channel" else "👥"
         buttons.append([
             InlineKeyboardButton(
-                f"{title} ({count} tilausta)",
-                callback_data=f"rg:{gid}"
+                f"{icon} {title} ({count} tilausta)",
+                callback_data=f"entity:{ent['chat_id']}"
             )
         ])
 
     await update.message.reply_text(
-        "*Ryhmät:*\nValitse hallittava ryhmä:",
-        parse_mode=ParseMode.MARKDOWN,
+        "<b>Liitetyt ryhmät ja kanavat:</b>\nValitse hallittava:",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -504,9 +501,9 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Käytä näin:\n\n`/config <lyhytaikainen-token>`\n\n"
+            "Käytä näin:\n\n<code>/config &lt;lyhytaikainen-token&gt;</code>\n\n"
             "Botti vaihtaa tokenin pitkäaikaiseksi (90pv) ja tallentaa sen.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -524,7 +521,7 @@ async def config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     })
     await update.message.reply_text(
         "✅ Token asetettu! Käytä /paivita päivittääksesi katalogi.",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -545,7 +542,7 @@ async def paivita(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await build_catalog()
     await msg.edit_text(
         f"✅ Katalogi päivitetty:\n🏙️ {len(CITIES)} kaupunkia · 🏢 {len(ORGS)} järjestöä · 🔁 {len(CHAINS)} ketjua",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -554,7 +551,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     subs = await get_subscriptions(chat_id)
     token_state = "✅" if token_manager.is_configured() else "❌"
     lines = [
-        f"*Botti status*",
+        f"<b>Botti status</b>",
         f"API token: {token_state}",
         f"Tilaukset: {len(subs)}",
     ]
@@ -562,7 +559,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from collections import Counter
         counts = Counter(s["sub_type"] for s in subs)
         lines.append("  " + ", ".join(f"{k}: {v}" for k, v in counts.items()))
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── Callbacks ──────────────────────────────────────────────────────
@@ -573,37 +570,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
     chat_id = query.message.chat_id
     chat_title = get_chat_title(update)
-    is_grp = _is_group(update)
+    is_entity = _is_group(update) or _is_channel(update)
 
     if data == "back_menu":
         await query.edit_message_text(
-            await _overview(chat_id, chat_title, is_group=is_grp),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=await _main_menu(is_group=is_grp),
+            await _overview(chat_id, chat_title, is_entity=is_entity),
+            parse_mode=ParseMode.HTML,
+            reply_markup=await _main_menu(is_group_or_channel=is_entity),
+        )
+        return
+
+    if data == "go_hallinta":
+        # Redirect to DM
+        await query.edit_message_text(
+            "Avaa botin DM-chatti ja käytä /hallinta hallitaksesi ryhmiä ja kanavia.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     if data == "cities":
-        await query.edit_message_text("🏙️ *Valitse kaupunki:*", parse_mode=ParseMode.MARKDOWN,
+        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=await _city_keyboard(chat_id))
         return
     if data == "orgs":
-        await query.edit_message_text("🏢 *Valitse järjestö (tai etsi):*", parse_mode=ParseMode.MARKDOWN,
+        await query.edit_message_text("🏢 <b>Valitse järjestö (tai etsi):</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=await _org_keyboard(chat_id))
         return
     if data == "chains":
-        await query.edit_message_text("🔁 *Valitse mielenosoitusketju:*", parse_mode=ParseMode.MARKDOWN,
+        await query.edit_message_text("🔁 <b>Valitse mielenosoitusketju:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=await _chain_keyboard(chat_id))
         return
     if data == "help":
         await query.edit_message_text(
-            "*Ohjeet*\n\n"
-            "🏙️ *Kaupungit* – ilmoitus kaikista mielenosoituksista kaupungissa.\n"
-            "🏢 *Järjestöt* – ilmoitus tietyn järjestön järjestämistä.\n"
-            "🔁 *Ketjut* – ilmoitus toistuvista mielenosoitusketjuista.\n\n"
+            "<b>Ohjeet</b>\n\n"
+            "🏙️ <b>Kaupungit</b> – ilmoitus kaikista mielenosoituksista kaupungissa.\n"
+            "🏢 <b>Järjestöt</b> – ilmoitus tietyn järjestön järjestämistä.\n"
+            "🔁 <b>Ketjut</b> – ilmoitus toistuvista mielenosoitusketjuista.\n\n"
             "Paina ➕ tilataksesi, ✅ poistaaksesi.\n"
-            "Etkö löydä järjestöä? Paina *Etsi järjestöä* ja kirjoita nimi.",
-            parse_mode=ParseMode.MARKDOWN,
+            "Etkö löydä järjestöä? Paina <b>Etsi järjestöä</b> ja kirjoita nimi.",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")]]),
         )
         return
@@ -612,45 +617,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text(
             "Kirjoita järjestön nimi (vähintään 2 merkkiä).\n"
             "Peruuta kirjoittamalla /peru.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    if data == "group_settings":
-        # In DM, show linked groups
-        groups = await get_linked_groups(chat_id)
-        if not groups:
-            await query.edit_message_text(
-                "Et ole liittänyt yhtään ryhmää.\n"
-                "Liitä ryhmä komennolla /liita <koodi>.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")]
-                ]),
-            )
-            return
-        buttons = []
-        for gid in groups:
-            subs = await get_subscriptions(gid)
-            count = len(subs)
-            title = subs[0]["chat_title"] if subs else str(gid)
-            buttons.append([
-                InlineKeyboardButton(f"{title} ({count})", callback_data=f"rg:{gid}")
-            ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
-        await query.edit_message_text(
-            "*Liitetyt ryhmät:*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
-
-    # Linked group management
-    if data.startswith("rg:"):
+    # Entity management (linked groups/channels)
+    if data.startswith("entity:"):
         gid = int(data.split(":")[1])
         subs = await get_subscriptions(gid)
         title = subs[0]["chat_title"] if subs else str(gid)
-        lines = [f"*{title} – tilaukset:*\n"]
+        lines = [f"<b>{title} – tilaukset:</b>\n"]
         city = [s["sub_label"] for s in subs if s["sub_type"] == "city"]
         org = [s["sub_label"] for s in subs if s["sub_type"] == "org"]
         chain = [s["sub_label"] for s in subs if s["sub_type"] == "chain"]
@@ -663,34 +639,52 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not subs:
             lines.append("Ei tilauksia.")
 
-        # Show sub-management buttons prefixed with group id
         buttons = [
-            [InlineKeyboardButton("🏙️ Kaupungit", callback_data=f"rg_city:{gid}")],
-            [InlineKeyboardButton("🏢 Järjestöt", callback_data=f"rg_org:{gid}")],
-            [InlineKeyboardButton("🔁 Ketjut", callback_data=f"rg_chain:{gid}")],
-            [InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")],
+            [InlineKeyboardButton("🏙️ Kaupungit", callback_data=f"ent_city:{gid}")],
+            [InlineKeyboardButton("🏢 Järjestöt", callback_data=f"ent_org:{gid}")],
+            [InlineKeyboardButton("🔁 Ketjut", callback_data=f"ent_chain:{gid}")],
+            [InlineKeyboardButton("◀️ Takaisin", callback_data="back_hallinta")],
         ]
         await query.edit_message_text(
             "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
 
-    if data.startswith("rg_city:"):
+    if data == "back_hallinta":
+        entities = await get_linked_entities(chat_id)
+        buttons = []
+        for ent in entities:
+            subs = await get_subscriptions(ent["chat_id"])
+            count = len(subs)
+            title = subs[0]["chat_title"] if subs else str(ent["chat_id"])
+            icon = "📢" if ent["type"] == "channel" else "👥"
+            buttons.append([
+                InlineKeyboardButton(f"{icon} {title} ({count})", callback_data=f"entity:{ent['chat_id']}")
+            ])
+        await query.edit_message_text(
+            "<b>Liitetyt ryhmät ja kanavat:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # Entity subscription toggles
+    if data.startswith("ent_city:"):
         gid = int(data.split(":")[1])
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "city")}
         buttons = [
             [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}",
-                                  callback_data=f"rg_city_tog:{gid}:{c}")]
+                                  callback_data=f"ent_city_tog:{gid}:{c}")]
             for c in CITIES
         ]
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"rg:{gid}")])
-        await query.edit_message_text("🏙️ *Valitse kaupunki:*", parse_mode=ParseMode.MARKDOWN,
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    if data.startswith("rg_city_tog:"):
+    if data.startswith("ent_city_tog:"):
         parts = data.split(":", 2)
         gid, city = int(parts[1]), parts[2]
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "city")}
@@ -698,34 +692,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await remove_subscription(gid, "city", city)
         else:
             await add_subscription(gid, "", "city", city, city)
-        # Rebuild keyboard
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "city")}
         buttons = [
             [InlineKeyboardButton(f"{'✅' if c in subs else '➕'} {c}",
-                                  callback_data=f"rg_city_tog:{gid}:{c}")]
+                                  callback_data=f"ent_city_tog:{gid}:{c}")]
             for c in CITIES
         ]
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"rg:{gid}")])
-        await query.edit_message_text("🏙️ *Valitse kaupunki:*", parse_mode=ParseMode.MARKDOWN,
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    if data.startswith("rg_org:"):
+    if data.startswith("ent_org:"):
         gid = int(data.split(":")[1])
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
         buttons = []
-        for org in ORGS[:30]:
+        for org in ORGS:
             mark = "✅" if org["id"] in subs else "➕"
             buttons.append([
                 InlineKeyboardButton(f"{mark} {org['name']}",
-                                     callback_data=f"rg_org_tog:{gid}:{org['id']}:{org['name']}")
+                                     callback_data=f"ent_org_tog:{gid}:{org['id']}:{org['name']}")
             ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"rg:{gid}")])
-        await query.edit_message_text("🏢 *Valitse järjestö:*", parse_mode=ParseMode.MARKDOWN,
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+        await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    if data.startswith("rg_org_tog:"):
+    if data.startswith("ent_org_tog:"):
         parts = data.split(":", 3)
         gid, org_id, org_name = int(parts[1]), parts[2], parts[3]
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
@@ -735,33 +728,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await add_subscription(gid, "", "org", org_id, org_name)
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
         buttons = []
-        for org in ORGS[:30]:
+        for org in ORGS:
             mark = "✅" if org["id"] in subs else "➕"
             buttons.append([
                 InlineKeyboardButton(f"{mark} {org['name']}",
-                                     callback_data=f"rg_org_tog:{gid}:{org['id']}:{org['name']}")
+                                     callback_data=f"ent_org_tog:{gid}:{org['id']}:{org['name']}")
             ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"rg:{gid}")])
-        await query.edit_message_text("🏢 *Valitse järjestö:*", parse_mode=ParseMode.MARKDOWN,
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+        await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    if data.startswith("rg_chain:"):
+    if data.startswith("ent_chain:"):
         gid = int(data.split(":")[1])
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "chain")}
         buttons = []
-        for chain in CHAINS[:30]:
+        for chain in CHAINS:
             mark = "✅" if chain["id"] in subs else "➕"
             buttons.append([
-                InlineKeyboardButton(f"{mark} {chain['title'][:40]}",
-                                     callback_data=f"rg_chain_tog:{gid}:{chain['id']}:{chain['title']}")
+                InlineKeyboardButton(f"{mark} {chain['title'][:50]}",
+                                     callback_data=f"ent_chain_tog:{gid}:{chain['id']}:{chain['title']}")
             ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"rg:{gid}")])
-        await query.edit_message_text("🔁 *Valitse mielenosoitusketju:*", parse_mode=ParseMode.MARKDOWN,
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+        await query.edit_message_text("🔁 <b>Valitse mielenosoitusketju:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    if data.startswith("rg_chain_tog:"):
+    if data.startswith("ent_chain_tog:"):
         parts = data.split(":", 3)
         gid, chain_id, chain_title = int(parts[1]), parts[2], parts[3]
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "chain")}
@@ -771,14 +764,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await add_subscription(gid, "", "chain", chain_id, chain_title)
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "chain")}
         buttons = []
-        for chain in CHAINS[:30]:
+        for chain in CHAINS:
             mark = "✅" if chain["id"] in subs else "➕"
             buttons.append([
-                InlineKeyboardButton(f"{mark} {chain['title'][:40]}",
-                                     callback_data=f"rg_chain_tog:{gid}:{chain['id']}:{chain['title']}")
+                InlineKeyboardButton(f"{mark} {chain['title'][:50]}",
+                                     callback_data=f"ent_chain_tog:{gid}:{chain['id']}:{chain['title']}")
             ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"rg:{gid}")])
-        await query.edit_message_text("🔁 *Valitse mielenosoitusketju:*", parse_mode=ParseMode.MARKDOWN,
+        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+        await query.edit_message_text("🔁 <b>Valitse mielenosoitusketju:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -788,7 +781,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         added = await add_subscription(chat_id, chat_title, "city", city, city)
         if not added:
             await remove_subscription(chat_id, "city", city)
-        await query.edit_message_text("🏙️ *Valitse kaupunki:*", parse_mode=ParseMode.MARKDOWN,
+        await query.edit_message_text("🏙️ <b>Valitse kaupunki:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=await _city_keyboard(chat_id))
         return
 
@@ -798,7 +791,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         added = await add_subscription(chat_id, chat_title, "org", org_id, org_name)
         if not added:
             await remove_subscription(chat_id, "org", org_id)
-        await query.edit_message_text("🏢 *Valitse järjestö:*", parse_mode=ParseMode.MARKDOWN,
+        await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=await _org_keyboard(chat_id))
         return
 
@@ -808,7 +801,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         added = await add_subscription(chat_id, chat_title, "chain", chain_id, chain_title)
         if not added:
             await remove_subscription(chat_id, "chain", chain_id)
-        await query.edit_message_text("🔁 *Valitse mielenosoitusketju:*", parse_mode=ParseMode.MARKDOWN,
+        await query.edit_message_text("🔁 <b>Valitse mielenosoitusketju:</b>", parse_mode=ParseMode.HTML,
                                       reply_markup=await _chain_keyboard(chat_id))
         return
 
@@ -837,7 +830,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not results:
         await update.message.reply_text(
             "Ei löytynyt järjestöjä haulla. Yritä toisella nimellä tai /peru.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -851,7 +844,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ])
     buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
     _org_search_pending.discard(chat_id)
-    await update.message.reply_text("Valitse järjestö:", parse_mode=ParseMode.MARKDOWN,
+    await update.message.reply_text("Valitse järjestö:", parse_mode=ParseMode.HTML,
                                     reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -871,26 +864,26 @@ async def listaa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _send_list_page(send_fn, page: int) -> None:
     if not token_manager.is_configured():
-        await send_fn("❌ API-tokenia ei ole asetettu. Käytä /config.", parse_mode=ParseMode.MARKDOWN)
+        await send_fn("❌ API-tokenia ei ole asetettu. Käytä /config.", parse_mode=ParseMode.HTML)
         return
 
     try:
-        data = await fetch_upcoming_demos(max_days_till=90, per_page=100)
+        data = await fetch_all_upcoming_demos(max_days_till=90, per_page=100)
     except Exception:
         logger.exception("Failed to fetch demos for listing")
-        await send_fn("❌ Mielenosoituksia ei voitu hakea.", parse_mode=ParseMode.MARKDOWN)
+        await send_fn("❌ Mielenosoituksia ei voitu hakea.", parse_mode=ParseMode.HTML)
         return
 
     total = len(data)
     if total == 0:
-        await send_fn("Ei tulevia mielenosoituksia.", parse_mode=ParseMode.MARKDOWN)
+        await send_fn("Ei tulevia mielenosoituksia.", parse_mode=ParseMode.HTML)
         return
 
     start = page * DEMO_LIST_PAGE_SIZE
     end = start + DEMO_LIST_PAGE_SIZE
     chunk = data[start:end]
 
-    lines = [f"*Tulevat mielenosoitukset* ({start+1}–{min(end, total)}/{total})\n"]
+    lines = [f"<b>Tulevat mielenosoitukset</b> ({start+1}–{min(end, total)}/{total})\n"]
     for d in chunk:
         lines.append(format_demo_compact(d))
 
@@ -906,7 +899,7 @@ async def _send_list_page(send_fn, page: int) -> None:
 
     await send_fn(
         "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
     )
 
@@ -927,7 +920,7 @@ def build_handlers(app) -> None:
     app.add_handler(CommandHandler("peru", peru))
     app.add_handler(CommandHandler("ryhma", ryhma))
     app.add_handler(CommandHandler("liita", liita))
-    app.add_handler(CommandHandler("ryhma_listaa", ryhma_listaa))
+    app.add_handler(CommandHandler("hallinta", hallinta))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
