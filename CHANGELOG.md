@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- Feature: organization picker now paginated (15 per page) in both the chat and `/hallinta` entity views.
 - Fix: org/chain picker buttons no longer break for long names — callback data is capped to Telegram's 64-byte limit and the full name is resolved from the catalog on toggle.
 - Fix: stale/too-old callback queries and `Button_data_invalid` edits no longer spam logs.
 

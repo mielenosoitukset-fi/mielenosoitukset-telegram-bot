@@ -50,6 +50,7 @@ _entity_city_search_term: dict[int, str] = {}
 
 CITY_PAGE_SIZE = 20
 CITY_SEARCH_MAX = 25
+ORG_PAGE_SIZE = 15
 
 # Pending entity pairing: code -> {entity_chat_id, entity_title, entity_type, created_at}
 _pending_pairing: dict[str, dict] = {}
@@ -306,17 +307,48 @@ def _chain_title(chain_id: str, fallback: str = "") -> str:
     return fallback
 
 
-async def _org_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+async def _org_page_markup(chat_id: int, page: int = 0) -> InlineKeyboardMarkup:
     subs = {s["sub_key"] for s in await get_subscriptions(chat_id, "org")}
-    buttons = []
-    for org in ORGS:
-        mark = "✅" if org["id"] in subs else "➕"
-        buttons.append([
-            InlineKeyboardButton(f"{mark} {org['name']}",
-                                 callback_data=_cb_cap(org["name"], f"org:{org['id']}:"))
-        ])
+    total_pages = max(1, (len(ORGS) + ORG_PAGE_SIZE - 1) // ORG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = ORGS[page * ORG_PAGE_SIZE:(page + 1) * ORG_PAGE_SIZE]
+    buttons = [
+        [InlineKeyboardButton(f"{'✅' if org['id'] in subs else '➕'} {org['name']}",
+                              callback_data=_cb_cap(org["name"], f"org_tog:{page}:{org['id']}:"))]
+        for org in chunk
+    ]
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"org_page:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"org_page:{page + 1}"))
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton("🔍 Etsi järjestöä", callback_data="search_org")])
     buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _ent_org_page_markup(gid: int, page: int = 0) -> InlineKeyboardMarkup:
+    subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
+    total_pages = max(1, (len(ORGS) + ORG_PAGE_SIZE - 1) // ORG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = ORGS[page * ORG_PAGE_SIZE:(page + 1) * ORG_PAGE_SIZE]
+    buttons = [
+        [InlineKeyboardButton(f"{'✅' if org['id'] in subs else '➕'} {org['name']}",
+                              callback_data=_cb_cap(org["name"], f"ent_org_tog:{gid}:{page}:{org['id']}:"))]
+        for org in chunk
+    ]
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"ent_org_page:{gid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"ent_org_page:{gid}:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -708,7 +740,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if data == "orgs":
         await query.edit_message_text("🏢 <b>Valitse järjestö (tai etsi):</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=await _org_keyboard(chat_id))
+                                      reply_markup=await _org_page_markup(chat_id))
+        return
+    if data.startswith("org_page:"):
+        page = int(data.split(":", 1)[1])
+        await query.edit_message_text("🏢 <b>Valitse järjestö (tai etsi):</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _org_page_markup(chat_id, page))
+        return
+    if data.startswith("org_tog:"):
+        parts = data.split(":", 3)
+        page, org_id = int(parts[1]), parts[2]
+        org_name = _org_name(parts[2], parts[3])
+        added = await add_subscription(chat_id, chat_title, "org", org_id, org_name)
+        if not added:
+            await remove_subscription(chat_id, "org", org_id)
+        await query.edit_message_text("🏢 <b>Valitse järjestö (tai etsi):</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _org_page_markup(chat_id, page))
         return
     if data == "chains":
         await query.edit_message_text("🔁 <b>Valitse mielenosoitusketju:</b>", parse_mode=ParseMode.HTML,
@@ -838,40 +885,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                           f"ent_city_page:{gid}", f"ent_city_search:{gid}", f"entity:{gid}"))
         return
 
-    if data.startswith("ent_org:"):
-        gid = int(data.split(":")[1])
-        subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
-        buttons = []
-        for org in ORGS:
-            mark = "✅" if org["id"] in subs else "➕"
-            buttons.append([
-                InlineKeyboardButton(f"{mark} {org['name']}",
-                                     callback_data=_cb_cap(org["name"], f"ent_org_tog:{gid}:{org['id']}:"))
-            ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
+    if data.startswith("ent_org_page:"):
+        _, gid, page = data.split(":", 2)
+        gid = int(gid)
         await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=InlineKeyboardMarkup(buttons))
+                                      reply_markup=await _ent_org_page_markup(gid, int(page)))
         return
 
     if data.startswith("ent_org_tog:"):
-        parts = data.split(":", 3)
-        gid, org_id, org_name = int(parts[1]), parts[2], _org_name(parts[2], parts[3])
+        parts = data.split(":", 4)
+        gid, page, org_id = int(parts[1]), int(parts[2]), parts[3]
+        org_name = _org_name(parts[3], parts[4])
         subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
         if org_id in subs:
             await remove_subscription(gid, "org", org_id)
         else:
             await add_subscription(gid, "", "org", org_id, org_name)
-        subs = {s["sub_key"] for s in await get_subscriptions(gid, "org")}
-        buttons = []
-        for org in ORGS:
-            mark = "✅" if org["id"] in subs else "➕"
-            buttons.append([
-                InlineKeyboardButton(f"{mark} {org['name']}",
-                                     callback_data=_cb_cap(org["name"], f"ent_org_tog:{gid}:{org['id']}:"))
-            ])
-        buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data=f"entity:{gid}")])
         await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=InlineKeyboardMarkup(buttons))
+                                      reply_markup=await _ent_org_page_markup(gid, page))
+        return
+
+    if data.startswith("ent_org:"):
+        gid = int(data.split(":")[1])
+        await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
+                                      reply_markup=await _ent_org_page_markup(gid))
         return
 
     if data.startswith("ent_chain:"):
@@ -951,16 +988,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                           int(page), "city_search", "cities", "back_menu"))
         return
 
-    if data.startswith("org:"):
-        parts = data.split(":", 2)
-        org_id, org_name = parts[1], _org_name(parts[1], parts[2])
-        added = await add_subscription(chat_id, chat_title, "org", org_id, org_name)
-        if not added:
-            await remove_subscription(chat_id, "org", org_id)
-        await query.edit_message_text("🏢 <b>Valitse järjestö:</b>", parse_mode=ParseMode.HTML,
-                                      reply_markup=await _org_keyboard(chat_id))
-        return
-
     if data.startswith("chain:"):
         parts = data.split(":", 2)
         chain_id, chain_title = parts[1], _chain_title(parts[1], parts[2])
@@ -1006,7 +1033,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             mark = "✅" if oid in subs else "➕"
             buttons.append([
                 InlineKeyboardButton(f"{mark} {oname}",
-                                     callback_data=_cb_cap(oname, f"org:{oid}:"))
+                                     callback_data=_cb_cap(oname, f"org_tog:0:{oid}:"))
             ])
         buttons.append([InlineKeyboardButton("◀️ Takaisin", callback_data="back_menu")])
         _org_search_pending.discard(chat_id)
