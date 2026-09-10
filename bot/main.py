@@ -29,10 +29,10 @@ async def poll_loop(application) -> None:
 
 async def handle_error(update, context) -> None:
     if isinstance(context.error, BadRequest):
-        message = str(context.error.message or "")
+        message = str(context.error.message or "").lower()
         if "message is not modified" in message:
             return
-        if "query is too old" in message.lower() or "button_data_invalid" in message:
+        if "query is too old" in message or "button_data_invalid" in message:
             return
     logger.error("Unhandled handler error", exc_info=context.error)
 
