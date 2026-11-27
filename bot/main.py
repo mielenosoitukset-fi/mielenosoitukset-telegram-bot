@@ -8,6 +8,7 @@ from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder
 
 from . import token_manager
+from .api_client import close_client
 from .config import settings
 from .database import init_db
 from .handlers import build_handlers, build_catalog, set_admin_from_env
@@ -92,6 +93,7 @@ async def run() -> None:
             poll_task.cancel()
             await application.updater.stop()
             await application.stop()
+            await close_client()
 
 
 def main() -> None:
