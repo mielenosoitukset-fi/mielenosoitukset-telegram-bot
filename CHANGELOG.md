@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- Fix: API calls now go through one shared HTTP client, paced to max ~4 requests/second, with backoff that honors `Retry-After` on 429/5xx. Stops `ratelimit 10 per 1 second` errors on `api.list_demonstrations`.
+- Fix: catalog build logs failed detail fetches (and 401/403 as "needs new API token") instead of swallowing them.
 - Feature: organization picker now paginated (15 per page) in both the chat and `/hallinta` entity views.
 - Fix: org/chain picker buttons no longer break for long names — callback data is capped to Telegram's 64-byte limit and the full name is resolved from the catalog on toggle.
 - Fix: stale/too-old callback queries and `Button_data_invalid` edits no longer spam logs.

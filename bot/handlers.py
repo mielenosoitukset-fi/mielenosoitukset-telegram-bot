@@ -131,14 +131,24 @@ async def build_catalog(max_days_till: int = 180) -> None:
             if oid and name:
                 org_map.setdefault(str(oid), name)
 
+        failed = 0
+        consecutive = 0
         for d in demos[:100]:
             demo_id = d.get("_id") or d.get("id")
             if not demo_id:
                 continue
             try:
                 detail = await fetch_demo_detail(demo_id)
-            except Exception:
+            except Exception as exc:
+                failed += 1
+                if failed == 1:
+                    logger.warning("Catalog detail fetch failed for %s: %s", demo_id, exc)
+                consecutive += 1
+                if consecutive >= 5:
+                    logger.error("Catalog: 5 detail fetches failed in a row, skipping remaining details")
+                    break
                 continue
+            consecutive = 0
             parent = detail.get("parent")
             if parent:
                 chain_set[str(parent)] = detail.get("title") or "Ketju"
@@ -149,6 +159,8 @@ async def build_catalog(max_days_till: int = 180) -> None:
                     if oid and name:
                         org_map.setdefault(str(oid), name)
 
+        if failed:
+            logger.warning("Catalog build: %d detail fetches failed (chains found: %d)", failed, len(chain_set))
         CHAINS = sorted(
             [{"id": pid, "title": title} for pid, title in chain_set.items()],
             key=lambda c: c["title"],
