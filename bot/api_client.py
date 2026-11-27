@@ -57,7 +57,7 @@ def _retry_after(r: httpx.Response, attempt: int) -> float:
     return min(2.0 ** attempt, MAX_RETRY_WAIT)
 
 
-async def _request(url: str, params: dict | None = None, headers: dict | None = None, quiet_statuses: tuple[int, ...] = ()) -> httpx.Response:
+async def _request(url: str, params: dict | None = None, headers: dict | None = None) -> httpx.Response:
     """GET with pacing, shared client, and backoff on 429/5xx/transport errors."""
     client = _get_client()
     last_exc: Exception | None = None
@@ -80,7 +80,7 @@ async def _request(url: str, params: dict | None = None, headers: dict | None = 
             logger.warning("API %s on %s; retry in %.1fs", r.status_code, url, delay)
             await asyncio.sleep(delay)
             continue
-        if r.status_code in (401, 403) and r.status_code not in quiet_statuses:
+        if r.status_code in (401, 403):
             logger.error("API %s on %s: token missing, expired or not allowed. Needs a new API token.", r.status_code, url)
         return r
     raise last_exc or RuntimeError("unreachable")
@@ -141,26 +141,9 @@ async def fetch_all_upcoming_demos(
     return all_demos
 
 
-# Demos the list returns but whose detail is not public (hidden, unapproved or removed). The site answers
-# 401/403/404 for them even without a token, so they are skipped quietly and not asked for again until restart.
-NOT_PUBLIC: set[str] = set()
-
-
-async def fetch_demo_detail(demo_id: str) -> dict | None:
-    """Detail of one demo, or None when it is not public (401/403/404)."""
-    if demo_id in NOT_PUBLIC:
-        return None
-    headers = {}
-    token = await token_manager.get_active_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    r = await _request(f"{settings.api_base_url}/demonstrations/{demo_id}", headers=headers, quiet_statuses=(401, 403))
-    if r.status_code in (401, 403, 404):
-        NOT_PUBLIC.add(demo_id)
-        logger.info("Demo %s is not public (HTTP %s); skipping it", demo_id, r.status_code)
-        return None
-    r.raise_for_status()
-    return r.json() or {}
+async def fetch_demo_detail(demo_id: str) -> dict:
+    data = await _get(f"/demonstrations/{demo_id}")
+    return data or {}
 
 
 async def fetch_all_demos_for_orgs(org_ids: list[str], max_days_till: int = 14) -> list[dict]:

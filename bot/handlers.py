@@ -149,8 +149,6 @@ async def build_catalog(max_days_till: int = 180) -> None:
                     break
                 continue
             consecutive = 0
-            if detail is None:   # not public: not a failure
-                continue
             parent = detail.get("parent")
             if parent:
                 chain_set[str(parent)] = detail.get("title") or "Ketju"
